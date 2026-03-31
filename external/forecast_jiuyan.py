@@ -314,9 +314,10 @@ def main() -> None:
         "--db", type=str, default=DB_PATH,
         help="SQLite 数据库路径",
     )
+    default_output = Path(__file__).parent / "jiuyan_forecasts.json"
     parser.add_argument(
-        "-o", "--output", type=str, default="jiuyan_forecasts.json",
-        help="输出文件路径 (默认 jiuyan_forecasts.json)",
+        "-o", "--output", type=str, default=str(default_output),
+        help=f"输出文件路径 (默认 {default_output})",
     )
     parser.add_argument(
         "--format", choices=["json", "csv"], default=None,

@@ -123,10 +123,11 @@ def run_forecast(model, inputs: list[np.ndarray], horizon: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser(description="TimesFM 纯净版回测对比")
+    default_output = Path(__file__).parent / "timesfm_backtest_results.csv"
     parser.add_argument("--cutoff", type=str, default="2025-02-01", help="回测切割点 (默认 2025-02-01)")
     parser.add_argument("--horizon", type=int, default=12, help="预测步长 (默认 12)")
     parser.add_argument("--max-skus", type=int, default=0, help="限制测试 SKU 数 (0=所有合规)")
-    parser.add_argument("--file", type=str, default="timesfm_backtest_results.csv", help="输出 CSV 路径")
+    parser.add_argument("--file", type=str, default=str(default_output), help=f"输出 CSV 路径 (默认 {default_output})")
     args = parser.parse_args()
 
     print("=" * 60)
