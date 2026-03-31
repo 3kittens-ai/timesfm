@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-backtest_jiuyan.py — 九研 SKU 销量 TimesFM 纯净版回测
+backtest_jiuyan.py — 九研 SKU 销量 TimesFM 2.5 纯净版回测
 
 用截止到 2025-02 的数据预测 2025-03 到 2026-02 (未来 12 个月) 的销量，
 并与数据库中 2025-03 到 2026-02 的实际销量进行对比，计算偏差 (MAE, MAPE, WAPE)。
+支持 CSV, JSON 和 Markdown 格式输出报表。
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import sqlite3
 import sys
 import time
+import json
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +39,7 @@ def load_backtest_data(
     df["date"] = pd.to_datetime(df["year_month"] + "-01")
     cutoff_ts = pd.Timestamp(cutoff_date)
     
-    # 填充缺失月份为 0
+    # 获取全局最大日期
     global_max = df["date"].max()
     
     inputs = []
@@ -63,7 +65,7 @@ def load_backtest_data(
         
         # 只保留未来刚好 horizon 长度的真实数据
         if len(future_df) < horizon:
-            continue  # 没有完整实际数据无法全面对比
+            continue
             
         future_series = future_df.iloc[:horizon]["monthly_qty"].values.astype(np.float32)
         history_series = history_df["monthly_qty"].values.astype(np.float32)
@@ -74,46 +76,51 @@ def load_backtest_data(
             sku_index.append(sku)
 
     if max_skus and len(inputs) > max_skus:
-        # 为了稳定，可以选择总销量排名靠前的 SKU 做测试
-        # 这里为了简单直接取前 max_skus
         inputs = inputs[:max_skus]
         actuals = actuals[:max_skus]
         sku_index = sku_index[:max_skus]
 
     return inputs, actuals, sku_index
 
-def load_model(horizon: int, max_context: int = 64, batch_size: int = 32):
-    """加载 TimesFM 1.0 PyTorch 模型。"""
+def load_model(horizon: int, max_context: int = 1024, batch_size: int = 32):
+    """加载 TimesFM 2.5 PyTorch 模型并编译。"""
     import torch
     import timesfm
 
     torch.set_float32_matmul_precision("high")
-    print("   正在加载 TimesFM 1.0 (200M)...")
-    hparams = timesfm.TimesFmHparams(
-        context_len=max_context,
-        horizon_len=horizon,
-        per_core_batch_size=batch_size,
+    print(f"   正在加载 TimesFM 2.5 (200M)...")
+    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+        "google/timesfm-2.5-200m-pytorch"
     )
-    checkpoint = timesfm.TimesFmCheckpoint(
-        huggingface_repo_id="google/timesfm-1.0-200m-pytorch"
+
+    print(f"   正在编译模型 (batch_size={batch_size}, max_context={max_context})...")
+    model.compile(
+        timesfm.ForecastConfig(
+            max_context=max_context,
+            max_horizon=max(256, horizon),
+            normalize_inputs=True,
+            use_continuous_quantile_head=True,
+            force_flip_invariance=True,
+            infer_is_positive=True,
+            fix_quantile_crossing=True,
+            per_core_batch_size=batch_size,
+        )
     )
-    model = timesfm.TimesFm(hparams=hparams, checkpoint=checkpoint)
+
     return model
 
 def run_forecast(model, inputs: list[np.ndarray], horizon: int) -> np.ndarray:
     """批量预测"""
     all_point = []
     total = len(inputs)
-    freqs = [0] * total  # 0 denotes monthly
 
     for start in range(0, total, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, total)
         batch = inputs[start:end]
-        batch_freqs = freqs[start:end]
         print(f"   预测中: [{start + 1}~{end}] / {total} SKU ...", end="", flush=True)
 
         t0 = time.time()
-        point, quantiles = model.forecast(inputs=batch, freq=batch_freqs)
+        point, quantiles = model.forecast(horizon=horizon, inputs=batch)
         elapsed = time.time() - t0
 
         all_point.append(point)
@@ -122,24 +129,55 @@ def run_forecast(model, inputs: list[np.ndarray], horizon: int) -> np.ndarray:
     return np.concatenate(all_point, axis=0)
 
 def main():
-    parser = argparse.ArgumentParser(description="TimesFM 纯净版回测对比")
-    default_output = Path(__file__).parent / "timesfm_backtest_results.csv"
+    parser = argparse.ArgumentParser(description="TimesFM 2.5 销量回测对比")
+    output_dir = Path(__file__).parent / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    default_csv = output_dir / "timesfm_backtest_2.5_results.csv"
+    default_json = output_dir / "timesfm_backtest_2.5_results.json"
+    default_md = output_dir / "timesfm_backtest_2.5_summary.md"
+
     parser.add_argument("--cutoff", type=str, default="2025-02-01", help="回测切割点 (默认 2025-02-01)")
     parser.add_argument("--horizon", type=int, default=12, help="预测步长 (默认 12)")
     parser.add_argument("--max-skus", type=int, default=0, help="限制测试 SKU 数 (0=所有合规)")
-    parser.add_argument("--file", type=str, default=str(default_output), help=f"输出 CSV 路径 (默认 {default_output})")
+    parser.add_argument("--skus", type=str, default="", help="指定特定的 SKU 编码 (逗号分隔或文件路径)")
+    parser.add_argument("--file", type=str, default=str(default_csv), help=f"输出 CSV 路径 (默认 {default_csv})")
+    parser.add_argument("--json", type=str, default=str(default_json), help=f"输出 JSON 指标路径 (默认 {default_json})")
+    parser.add_argument("--md", type=str, default=str(default_md), help=f"输出 Markdown 报告路径 (默认 {default_md})")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  TimesFM 销量回测: 隐藏真实数据，预测并对比")
+    print("  TimesFM 2.5 销量回测: 隐藏真实数据，预测并对比")
     print(f"  预测时间段: {args.cutoff} 之后 {args.horizon} 个月")
     print("=" * 60)
+
+    # 处理特定的 SKUs
+    target_skus = []
+    if args.skus:
+        if Path(args.skus).is_file():
+            with open(args.skus, "r") as f:
+                target_skus = [line.strip() for line in f if line.strip()]
+        else:
+            target_skus = [s.strip() for s in args.skus.split(",")]
+        args.max_skus = 0 
 
     max_skus_arg = args.max_skus if args.max_skus > 0 else None
     inputs, actuals, sku_index = load_backtest_data(
         DB_PATH, args.cutoff, args.horizon, min_context_months=12, max_skus=max_skus_arg
     )
     
+    # 手动过滤指定 SKU
+    if target_skus:
+        filtered_inputs, filtered_actuals, filtered_sku_index = [], [], []
+        target_set = set(target_skus)
+        for i, sku in enumerate(sku_index):
+            clean_sku = str(sku).split(".")[0]
+            if clean_sku in target_set or str(sku) in target_set:
+                filtered_inputs.append(inputs[i])
+                filtered_actuals.append(actuals[i])
+                filtered_sku_index.append(sku)
+        inputs, actuals, sku_index = filtered_inputs, filtered_actuals, filtered_sku_index
+
     if len(inputs) == 0:
         print("🛑 找不到符合条件的 SKU。")
         sys.exit(1)
@@ -149,19 +187,15 @@ def main():
     max_context = min(max(64, max([len(i) for i in inputs])), 16384)
     model = load_model(args.horizon, max_context=max_context)
 
-    print(f"\n🚀 开始纯净版预测...")
+    print(f"\n🚀 开始 TimesFM 2.5 纯净版预测...")
     point = run_forecast(model, inputs, args.horizon)
     actuals_np = np.array(actuals)
-    
-    # 将模型输出小于0的值归零
     point = np.maximum(point, 0)
 
     # ---------------- 整体误差统计 ----------------
-    # 绝对误差 / 实际总量 (WAPE: Weighted Absolute Percentage Error)
     total_abs_error = np.sum(np.abs(point - actuals_np))
     total_actual = np.sum(actuals_np)
     wape = total_abs_error / total_actual if total_actual > 0 else 0
-    
     mae = np.mean(np.abs(point - actuals_np))
     rmse = np.sqrt(np.mean((point - actuals_np) ** 2))
     
@@ -174,8 +208,9 @@ def main():
     print(f"  平均绝对误差 (MAE):  {mae:.2f} 件/月/SKU")
     print(f"  均方根误差 (RMSE): {rmse:.2f} 件/月/SKU")
 
-    # 构建汇总 DataFrame 供详情查阅
+    # 构建详情与汇总
     rows = []
+    summary_rows = []
     future_months = pd.date_range(start=pd.Timestamp(args.cutoff) + pd.offsets.MonthBegin(1), periods=args.horizon, freq="MS")
     
     for i, sku in enumerate(sku_index):
@@ -187,10 +222,62 @@ def main():
                  "timesfm_point": round(float(point[i][h]), 1),
                  "abs_error": round(abs(float(point[i][h]) - float(actuals[i][h])), 1)
              })
+        sum_act = np.sum(actuals[i])
+        sum_pred = np.sum(point[i])
+        sum_abs_err = np.sum(np.abs(point[i] - actuals[i]))
+        sku_wape = sum_abs_err / sum_act if sum_act > 0 else 0
+        sku_bias = (sum_pred - sum_act) / sum_act if sum_act > 0 else 0
+        summary_rows.append({
+            "sku_code": sku,
+            "total_actual": int(sum_act),
+            "total_forecast": int(sum_pred),
+            "abs_error": int(sum_abs_err),
+            "wape": float(sku_wape),
+            "bias": float(sku_bias)
+        })
              
     result_df = pd.DataFrame(rows)
     result_df.to_csv(args.file, index=False, encoding="utf-8-sig")
     print(f"\n✅ 详细结果已导出至 {args.file}")
+
+    if args.json:
+        json_data = {
+            "metrics": {
+                "total_actual": int(total_actual),
+                "total_abs_error": int(total_abs_error),
+                "wape": float(wape),
+                "mae": float(mae),
+                "rmse": float(rmse)
+            },
+            "skus": summary_rows
+        }
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        print(f"✅ 指标数据已导出至 {args.json}")
+
+    if args.md:
+        md_content = [
+            f"# TimesFM 2.5 回测报告 ({args.cutoff}, {args.horizon}个月)",
+            "",
+            "## 1. 宏观指标概览",
+            f"- **总真实销量**: {total_actual:,.0f}",
+            f"- **总预测偏差**: {total_abs_error:,.0f}",
+            f"- **全局 WAPE**: {wape * 100:.2f}%",
+            f"- **MAE**: {mae:.2f}",
+            "",
+            "## 2. SKU 详情对照表",
+            "| SKU 编码 | 实际总销量 | 预测总销量 | 绝对误差量 | WAPE | Bias |",
+            "|---|---:|---:|---:|---:|---:|"
+        ]
+        sorted_summary = sorted(summary_rows, key=lambda x: x["total_actual"], reverse=True)
+        for s in sorted_summary:
+            wape_str = f"{s['wape']*100:.1f}%"
+            bias_str = f"{s['bias']*100:+.1f}%"
+            md_content.append(f"| {s['sku_code']} | {s['total_actual']:,} | {s['total_forecast']:,} | {s['abs_error']:,} | {wape_str} | {bias_str} |")
+        
+        with open(args.md, "w", encoding="utf-8") as f:
+            f.write("\n".join(md_content))
+        print(f"✅ 回测报告已生成至 {args.md}")
     
     print("\n── 随机抽样 3 个 SKU 全周期对比 ──")
     sample_indices = np.random.choice(len(sku_index), min(3, len(sku_index)), replace=False)

@@ -159,23 +159,31 @@ def run_preflight(num_series: int, context_length: int, horizon: int) -> None:
 # ──────────────────────────────────────────────
 # 模型加载 & 预测
 # ──────────────────────────────────────────────
-def load_model(horizon: int, max_context: int = 64, batch_size: int = 32):
-    """加载 TimesFM 1.0 PyTorch 模型。"""
+def load_model(horizon: int, max_context: int = 1024, batch_size: int = 32):
+    """加载 TimesFM 2.5 PyTorch 模型并编译。"""
     import torch
     import timesfm
 
     torch.set_float32_matmul_precision("high")
 
-    print("   正在从 HuggingFace 加载 TimesFM 1.0 (200M) ...")
-    hparams = timesfm.TimesFmHparams(
-        context_len=max_context,
-        horizon_len=horizon,
-        per_core_batch_size=batch_size,
+    print(f"   正在加载 TimesFM 2.5 (200M) ...")
+    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+        "google/timesfm-2.5-200m-pytorch"
     )
-    checkpoint = timesfm.TimesFmCheckpoint(
-        huggingface_repo_id="google/timesfm-1.0-200m-pytorch"
+
+    print(f"   正在编译模型 (batch_size={batch_size}, max_context={max_context})...")
+    model.compile(
+        timesfm.ForecastConfig(
+            max_context=max_context,
+            max_horizon=max(256, horizon),
+            normalize_inputs=True,
+            use_continuous_quantile_head=True,
+            force_flip_invariance=True,
+            infer_is_positive=True,
+            fix_quantile_crossing=True,
+            per_core_batch_size=batch_size,
+        )
     )
-    model = timesfm.TimesFm(hparams=hparams, checkpoint=checkpoint)
 
     return model
 
@@ -187,16 +195,15 @@ def run_forecast(
     all_point = []
     all_quant = []
     total = len(inputs)
-    freqs = [0] * total  # 0 denotes monthly frequency for TimesFM 1.0
 
     for start in range(0, total, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, total)
         batch = inputs[start:end]
-        batch_freqs = freqs[start:end]
         print(f"   预测中: [{start + 1}~{end}] / {total} SKU ...", end="", flush=True)
 
         t0 = time.time()
-        point, quantiles = model.forecast(inputs=batch, freq=batch_freqs)
+        # TimesFM 2.5 doesn't need freq
+        point, quantiles = model.forecast(horizon=horizon, inputs=batch)
         elapsed = time.time() - t0
 
         all_point.append(point)
@@ -231,9 +238,9 @@ def build_result_df(
                     "sku_code": sku,
                     "forecast_month": future_months[h].strftime("%Y-%m"),
                     "forecast_qty": round(float(point[i, h]), 1),
-                    "lower_80": round(float(quantiles[i, h, 0]), 1),  # q10 (index 0)
-                    "upper_80": round(float(quantiles[i, h, 8]), 1),  # q90 (index 8)
-                    "median": round(float(quantiles[i, h, 4]), 1),    # q50 (index 4)
+                    "lower_80": round(float(quantiles[i, h, 1]), 1),  # q10 (index 1 in 2.5)
+                    "upper_80": round(float(quantiles[i, h, 9]), 1),  # q90 (index 9 in 2.5)
+                    "median": round(float(quantiles[i, h, 5]), 1),    # q50 (index 5 in 2.5)
                 }
             )
 
@@ -261,9 +268,9 @@ def save_json(
         results[sku] = {
             "months": month_labels,
             "forecast": [round(float(v), 1) for v in point[i]],
-            "lower_80": [round(float(v), 1) for v in quantiles[i, :, 0]],
-            "upper_80": [round(float(v), 1) for v in quantiles[i, :, 8]],
-            "median": [round(float(v), 1) for v in quantiles[i, :, 4]],
+            "lower_80": [round(float(v), 1) for v in quantiles[i, :, 1]],
+            "upper_80": [round(float(v), 1) for v in quantiles[i, :, 9]],
+            "median": [round(float(v), 1) for v in quantiles[i, :, 5]],
         }
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -314,7 +321,9 @@ def main() -> None:
         "--db", type=str, default=DB_PATH,
         help="SQLite 数据库路径",
     )
-    default_output = Path(__file__).parent / "jiuyan_forecasts.json"
+    output_dir = Path(__file__).parent / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    default_output = output_dir / "jiuyan_forecasts.json"
     parser.add_argument(
         "-o", "--output", type=str, default=str(default_output),
         help=f"输出文件路径 (默认 {default_output})",
@@ -343,7 +352,7 @@ def main() -> None:
         sku_filter = [s.strip() for s in args.skus.split(",")]
 
     print("=" * 56)
-    print("  九研 SKU 销量预测 — TimesFM 1.0 (PyTorch)")
+    print("  九研 SKU 销量预测 — TimesFM 2.5 (PyTorch)")
     print("=" * 56)
 
     # 1. 加载数据
@@ -405,8 +414,8 @@ def main() -> None:
             print(
                 f"  {future_months[h].strftime('%Y-%m'):>10s}"
                 f"  {point[i, h]:>8.0f}"
-                f"  {quantiles[i, h, 0]:>8.0f}"
-                f"  {quantiles[i, h, 8]:>8.0f}"
+                f"  {quantiles[i, h, 1]:>8.0f}"
+                f"  {quantiles[i, h, 9]:>8.0f}"
             )
         if args.horizon > 6:
             print(f"  ... 共 {args.horizon} 个月")
