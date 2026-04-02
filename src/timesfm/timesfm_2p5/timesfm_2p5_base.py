@@ -81,6 +81,14 @@ def linear_interpolation(arr):
   return arr
 
 
+def _safe_suffix(arr: Sequence[float] | np.ndarray, length: int) -> np.ndarray:
+  """Returns the last `length` elements, handling `length == 0` safely."""
+  arr = np.array(arr)
+  if length <= 0:
+    return arr[:0]
+  return arr[-length:]
+
+
 @dataclasses.dataclass(frozen=True)
 class TimesFM_2p5_200M_Definition:
   """Framework-agnostic config of TimesFM 2.5."""
@@ -325,8 +333,10 @@ class TimesFM_2p5:
       )
       targets = [
         (
-          np.array(input_ts)[-train_len:]
-          - point_output[: -self.forecast_config.max_horizon][-train_len:]
+          _safe_suffix(input_ts, train_len)
+          - _safe_suffix(
+            point_output[: -self.forecast_config.max_horizon], train_len
+          )
         )
         for input_ts, point_output, train_len in zip(inputs, point_outputs, train_lens)
       ]
@@ -370,7 +380,7 @@ class TimesFM_2p5:
     else:
       # Fit a model on the targets then forecast on the residuals via TimesFM.
       targets = [
-        np.array(input_ts)[-train_len:]
+        _safe_suffix(input_ts, train_len)
         for input_ts, train_len in zip(inputs, train_lens)
       ]
       per_instance_stats = None

@@ -59,7 +59,12 @@ def _to_padded_jax_array(x: np.ndarray) -> jax.Array:
 
 # Per time series normalization: forward.
 def normalize(batch):
-  stats = [(np.mean(x), np.where((w := np.std(x)) > _TOL, w, 1.0)) for x in batch]
+  stats = []
+  for x in batch:
+    if len(x) == 0:
+      stats.append((0.0, 1.0))
+    else:
+      stats.append((np.mean(x), np.where((w := np.std(x)) > _TOL, w, 1.0)))
   new_batch = [(x - stat[0]) / stat[1] for x, stat in zip(batch, stats)]
   return new_batch, stats
 
@@ -456,6 +461,18 @@ class BatchedInContextXRegLinear(BatchedInContextXRegBase):
         - the covariate matrix for the context, and
         - the covariate matrix for the horizon.
     """
+    if sum(self.train_lens) == 0:
+      outputs = [np.zeros((test_len,), dtype=np.float32) for test_len in self.test_lens]
+      if debug_info:
+        outputs_context = [
+          np.zeros((train_len,), dtype=np.float32) for train_len in self.train_lens
+        ]
+        flat_targets = np.zeros((0,), dtype=np.float32)
+        x_train = np.zeros((0, 0), dtype=np.float32)
+        x_test = np.zeros((sum(self.test_lens), 0), dtype=np.float32)
+        return outputs, outputs_context, flat_targets, x_train, x_test
+      return outputs
+
     flat_targets, x_train_raw, x_test = self.create_covariate_matrix(
       one_hot_encoder_drop=one_hot_encoder_drop,
       use_intercept=use_intercept,
