@@ -4,7 +4,7 @@ backtest_jiuyan.py — 九研 SKU 销量 TimesFM 2.5 纯净版回测
 
 用截止到 2025-02 的数据预测 2025-03 到 2026-02 (未来 12 个月) 的销量，
 并与数据库中 2025-03 到 2026-02 的实际销量进行对比，计算偏差 (MAE, MAPE, WAPE)。
-支持 CSV, JSON 和 Markdown 格式输出报表。
+支持输出明细 CSV，并可选输出 JSON 和 Markdown 汇总报表。
 """
 
 from __future__ import annotations
@@ -63,11 +63,12 @@ def load_backtest_data(
         history_df = merged[merged["date"] <= cutoff_ts]
         future_df = merged[merged["date"] > cutoff_ts]
         
-        # 只保留未来刚好 horizon 长度的真实数据
-        if len(future_df) < horizon:
-            continue
-            
-        future_series = future_df.iloc[:horizon]["monthly_qty"].values.astype(np.float32)
+        # 允许未来数据长度小于 horizon (用于预测未来)
+        future_series = np.full(horizon, np.nan, dtype=np.float32)
+        actual_len = min(len(future_df), horizon)
+        if actual_len > 0:
+            future_series[:actual_len] = future_df.iloc[:actual_len]["monthly_qty"].values.astype(np.float32)
+        
         history_series = history_df["monthly_qty"].values.astype(np.float32)
         
         if len(history_series) >= min_context_months:
@@ -130,7 +131,7 @@ def run_forecast(model, inputs: list[np.ndarray], horizon: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser(description="TimesFM 2.5 销量回测对比")
-    output_dir = Path(__file__).parent / "outputs"
+    output_dir = Path(__file__).parent / "outputs" / "backtest"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     default_csv = output_dir / "timesfm_backtest_2.5_results.csv"
@@ -192,21 +193,31 @@ def main():
     actuals_np = np.array(actuals)
     point = np.maximum(point, 0)
 
-    # ---------------- 整体误差统计 ----------------
-    total_abs_error = np.sum(np.abs(point - actuals_np))
-    total_actual = np.sum(actuals_np)
-    wape = total_abs_error / total_actual if total_actual > 0 else 0
-    mae = np.mean(np.abs(point - actuals_np))
-    rmse = np.sqrt(np.mean((point - actuals_np) ** 2))
+    # ---------------- 整体误差统计 (只统计非 NaN 的月份) ----------------
+    mask = ~np.isnan(actuals_np)
+    if np.any(mask):
+        valid_point = point[mask]
+        valid_actual = actuals_np[mask]
+        total_abs_error = np.sum(np.abs(valid_point - valid_actual))
+        total_actual = np.sum(valid_actual)
+        wape = total_abs_error / total_actual if total_actual > 0 else 0
+        mae = np.mean(np.abs(valid_point - valid_actual))
+        rmse = np.sqrt(np.mean((valid_point - valid_actual) ** 2))
+    else:
+        total_abs_error = 0
+        total_actual = 0
+        wape = 0
+        mae = 0
+        rmse = 0
     
     print("\n" + "=" * 60)
-    print("  回测结果总览 (全体 SKU 宏观评测)")
+    print("  回测结果总览 (只统计已有真实数据的月份，如 2026-03)")
     print("=" * 60)
+    print(f"  统计样本数 (SKU-月): {np.sum(mask)}")
     print(f"  总真实销量: {total_actual:,.0f} 件")
     print(f"  总预测偏差: {total_abs_error:,.0f} 件")
-    print(f"  全局 WAPE:  {wape * 100:.2f}% (总体偏差率，越低越好)")
+    print(f"  全局 WAPE:  {wape * 100:.2f}%")
     print(f"  平均绝对误差 (MAE):  {mae:.2f} 件/月/SKU")
-    print(f"  均方根误差 (RMSE): {rmse:.2f} 件/月/SKU")
 
     # 构建详情与汇总
     rows = []
@@ -215,18 +226,24 @@ def main():
     
     for i, sku in enumerate(sku_index):
         for h in range(args.horizon):
+             act_val = float(actuals[i][h])
              rows.append({
                  "sku_code": sku,
                  "month": future_months[h].strftime("%Y-%m"),
-                 "actual": float(actuals[i][h]),
-                 "timesfm_point": round(float(point[i][h]), 1),
-                 "abs_error": round(abs(float(point[i][h]) - float(actuals[i][h])), 1)
+                 "actual": act_val if not np.isnan(act_val) else None,
+                 "forecast": round(float(point[i][h]), 1),
              })
-        sum_act = np.sum(actuals[i])
-        sum_pred = np.sum(point[i])
-        sum_abs_err = np.sum(np.abs(point[i] - actuals[i]))
-        sku_wape = sum_abs_err / sum_act if sum_act > 0 else 0
-        sku_bias = (sum_pred - sum_act) / sum_act if sum_act > 0 else 0
+        
+        sku_mask = ~np.isnan(actuals[i])
+        if np.any(sku_mask):
+            sum_act = np.sum(actuals[i][sku_mask])
+            sum_pred = np.sum(point[i][sku_mask])
+            sum_abs_err = np.sum(np.abs(point[i][sku_mask] - actuals[i][sku_mask]))
+            sku_wape = sum_abs_err / sum_act if sum_act > 0 else 0
+            sku_bias = (sum_pred - sum_act) / sum_act if sum_act > 0 else 0
+        else:
+            sum_act, sum_pred, sum_abs_err, sku_wape, sku_bias = 0, 0, 0, 0, 0
+
         summary_rows.append({
             "sku_code": sku,
             "total_actual": int(sum_act),
@@ -236,7 +253,7 @@ def main():
             "bias": float(sku_bias)
         })
              
-    result_df = pd.DataFrame(rows)
+    result_df = pd.DataFrame(rows, columns=["sku_code", "month", "actual", "forecast"])
     result_df.to_csv(args.file, index=False, encoding="utf-8-sig")
     print(f"\n✅ 详细结果已导出至 {args.file}")
 
