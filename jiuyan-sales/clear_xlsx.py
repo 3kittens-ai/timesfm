@@ -5,6 +5,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
+CLEAN_PATTERNS = ("*.xlsx", "*.csv")
 
 
 def clear_xlsx_files(output_dir: Path = OUTPUT_DIR) -> int:
@@ -13,13 +14,14 @@ def clear_xlsx_files(output_dir: Path = OUTPUT_DIR) -> int:
         return 0
 
     deleted_count = 0
-    for file_path in output_dir.glob("*.xlsx"):
-        if file_path.is_file():
-            file_path.unlink()
-            deleted_count += 1
-            print(f"已删除: {file_path}")
+    for pattern in CLEAN_PATTERNS:
+        for file_path in output_dir.glob(pattern):
+            if file_path.is_file():
+                file_path.unlink()
+                deleted_count += 1
+                print(f"已删除: {file_path}")
 
-    print(f"完成，共删除 {deleted_count} 个 xlsx 文件。")
+    print(f"完成，共删除 {deleted_count} 个 xlsx/csv 文件。")
     return deleted_count
 
 
