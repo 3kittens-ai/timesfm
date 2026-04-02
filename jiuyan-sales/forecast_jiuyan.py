@@ -38,6 +38,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# 优先使用当前仓库源码，避免落到虚拟环境中的旧版 timesfm 包。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = REPO_ROOT / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
 # ──────────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────────
@@ -81,14 +87,36 @@ def load_data(
     else:
         df = pd.read_sql(query, conn)
 
-    conn.close()
-
     if df.empty:
+        conn.close()
         print("🛑 查询结果为空，请检查数据库或 SKU 编码。")
         sys.exit(1)
 
     df["date"] = pd.to_datetime(df["year_month"] + "-01")
     global_max = df["date"].max()
+
+    latest_sale_date = pd.read_sql(
+        "SELECT MAX(sale_date) AS latest_sale_date FROM sales",
+        conn,
+    ).iloc[0, 0]
+    conn.close()
+
+    latest_sale_ts = pd.to_datetime(latest_sale_date) if latest_sale_date else None
+    if latest_sale_ts is not None and not latest_sale_ts.is_month_end:
+        incomplete_month = latest_sale_ts.to_period("M").to_timestamp()
+        if incomplete_month <= global_max:
+            print(
+                "   ⚠️ 检测到未完结月份，已自动忽略: "
+                f"{incomplete_month.strftime('%Y-%m')} "
+                f"(最新销售日期 {latest_sale_ts.strftime('%Y-%m-%d')})"
+            )
+            df = df[df["date"] < incomplete_month].copy()
+
+            if df.empty:
+                print("🛑 过滤未完结月份后没有可用历史数据。")
+                sys.exit(1)
+
+            global_max = df["date"].max()
 
     print(f"   数据范围: {df['date'].min().strftime('%Y-%m')} → {global_max.strftime('%Y-%m')}")
     print(f"   原始 SKU 数: {df['variant_key'].nunique()}")
