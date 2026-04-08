@@ -78,92 +78,50 @@ def safe_pct_change(old_value: float, new_value: float) -> str:
     return f"{(new_value - old_value) / old_value * 100:+.2f}%"
 
 
-def summarize_sku_diff(old_payload: dict, new_payload: dict) -> dict | None:
-    old_months = list(old_payload.get("months") or [])
-    new_months = list(new_payload.get("months") or [])
-    old_forecast = list(old_payload.get("forecast") or [])
-    new_forecast = list(new_payload.get("forecast") or [])
-
+def summarize_sku_diff_for_month(old_payload: dict, new_payload: dict, target_month: str) -> dict | None:
     old_map = {
         str(month): float(value or 0)
-        for month, value in zip(old_months, old_forecast)
+        for month, value in zip(old_payload.get("months") or [], old_payload.get("forecast") or [])
     }
     new_map = {
         str(month): float(value or 0)
-        for month, value in zip(new_months, new_forecast)
+        for month, value in zip(new_payload.get("months") or [], new_payload.get("forecast") or [])
     }
-
-    shared_months = [month for month in old_months if month in new_map]
-    if not shared_months:
+    if target_month not in old_map or target_month not in new_map:
         return None
 
-    old_total = sum(old_map[month] for month in shared_months)
-    new_total = sum(new_map[month] for month in shared_months)
-    delta = new_total - old_total
-
+    old_value = old_map[target_month]
+    new_value = new_map[target_month]
+    delta = new_value - old_value
     return {
-        "shared_months": shared_months,
-        "shared_month_count": len(shared_months),
-        "old_total": old_total,
-        "new_total": new_total,
+        "target_month": target_month,
+        "old_total": old_value,
+        "new_total": new_value,
         "delta": delta,
         "abs_delta": abs(delta),
-        "pct_change": safe_pct_change(old_total, new_total),
+        "pct_change": safe_pct_change(old_value, new_value),
     }
-
-
-def build_month_summary(common_skus: set[str], old_data: dict[str, dict], new_data: dict[str, dict]) -> list[dict]:
-    month_totals: dict[str, dict[str, float]] = {}
-
-    for sku in common_skus:
-        old_payload = old_data[sku]
-        new_payload = new_data[sku]
-        old_map = {
-            str(month): float(value or 0)
-            for month, value in zip(old_payload.get("months") or [], old_payload.get("forecast") or [])
-        }
-        new_map = {
-            str(month): float(value or 0)
-            for month, value in zip(new_payload.get("months") or [], new_payload.get("forecast") or [])
-        }
-        shared_months = [month for month in old_map if month in new_map]
-        for month in shared_months:
-            bucket = month_totals.setdefault(month, {"old_total": 0.0, "new_total": 0.0, "sku_count": 0})
-            bucket["old_total"] += old_map[month]
-            bucket["new_total"] += new_map[month]
-            bucket["sku_count"] += 1
-
-    results = []
-    for month in sorted(month_totals):
-        old_total = month_totals[month]["old_total"]
-        new_total = month_totals[month]["new_total"]
-        results.append(
-            {
-                "month": month,
-                "sku_count": int(month_totals[month]["sku_count"]),
-                "old_total": old_total,
-                "new_total": new_total,
-                "delta": new_total - old_total,
-                "pct_change": safe_pct_change(old_total, new_total),
-            }
-        )
-    return results
 
 
 def format_number(value: float) -> str:
     return f"{value:,.1f}"
 
 
-def render_rank_table(rows: list[dict], title: str, old_date: str, new_date: str) -> list[str]:
-    lines = [f"## {title}", "", f"| SKU | 共同月份数 | {old_date} 预测合计 | {new_date} 预测合计 | 差值 | 变化幅度 |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
+def render_rank_table(rows: list[dict], title: str, old_date: str, new_date: str, target_month: str) -> list[str]:
+    lines = [
+        f"## {title}",
+        "",
+        f"| SKU | {old_date} {target_month} 月预测量 | {new_date} {target_month} 月预测量 | 差值 | 变化幅度 |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
     if not rows:
-        lines.append("| - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - |")
         lines.append("")
         return lines
 
     for row in rows:
         lines.append(
-            f"| {row['sku']} | {row['shared_month_count']} | {format_number(row['old_total'])} | "
+            f"| {row['sku']} | {format_number(row['old_total'])} | "
             f"{format_number(row['new_total'])} | {format_number(row['delta'])} | {row['pct_change']} |"
         )
     lines.append("")
@@ -173,6 +131,7 @@ def render_rank_table(rows: list[dict], title: str, old_date: str, new_date: str
 def generate_report(old_file: ForecastFile, new_file: ForecastFile, top_n: int) -> tuple[str, Path]:
     old_data = load_forecast_json(old_file.path)
     new_data = load_forecast_json(new_file.path)
+    target_month = f"{new_file.date_str[:4]}-{new_file.date_str[4:6]}"
 
     old_skus = set(old_data)
     new_skus = set(new_data)
@@ -180,28 +139,25 @@ def generate_report(old_file: ForecastFile, new_file: ForecastFile, top_n: int) 
     old_only = sorted(old_skus - new_skus)
     new_only = sorted(new_skus - old_skus)
 
-    sku_diffs = []
-    changed_count = 0
-    old_total_shared = 0.0
-    new_total_shared = 0.0
+    target_month_diffs = []
+    changed_count_target_month = 0
+    old_total_target_month = 0.0
+    new_total_target_month = 0.0
 
     for sku in sorted(common_skus):
-        summary = summarize_sku_diff(old_data[sku], new_data[sku])
-        if summary is None:
-            continue
-        summary["sku"] = sku
-        sku_diffs.append(summary)
-        old_total_shared += summary["old_total"]
-        new_total_shared += summary["new_total"]
-        if not math.isclose(summary["delta"], 0.0, abs_tol=1e-9):
-            changed_count += 1
+        target_month_summary = summarize_sku_diff_for_month(old_data[sku], new_data[sku], target_month)
+        if target_month_summary is not None:
+            target_month_summary["sku"] = sku
+            target_month_diffs.append(target_month_summary)
+            old_total_target_month += target_month_summary["old_total"]
+            new_total_target_month += target_month_summary["new_total"]
+            if not math.isclose(target_month_summary["delta"], 0.0, abs_tol=1e-9):
+                changed_count_target_month += 1
 
-    sku_diffs.sort(key=lambda item: item["delta"], reverse=True)
-    top_increase = sku_diffs[:top_n]
-    top_decrease = sorted(sku_diffs, key=lambda item: item["delta"])[:top_n]
-    month_summary = build_month_summary(common_skus, old_data, new_data)
-
-    abs_deltas = [item["abs_delta"] for item in sku_diffs]
+    target_month_diffs.sort(key=lambda item: item["delta"], reverse=True)
+    top_increase = target_month_diffs[:top_n]
+    top_decrease = sorted(target_month_diffs, key=lambda item: item["delta"])[:top_n]
+    abs_deltas = [item["abs_delta"] for item in target_month_diffs]
     avg_abs_delta = sum(abs_deltas) / len(abs_deltas) if abs_deltas else 0.0
     median_abs_delta = median(abs_deltas) if abs_deltas else 0.0
 
@@ -210,10 +166,8 @@ def generate_report(old_file: ForecastFile, new_file: ForecastFile, top_n: int) 
         "",
         "## 文件概况",
         "",
-        f"- 新文件日期: `{new_file.date_str}`",
-        f"- 新文件路径: `{new_file.path}`",
-        f"- 旧文件日期: `{old_file.date_str}`",
-        f"- 旧文件路径: `{old_file.path}`",
+        f"- 新文件销售数据截止日期: `{new_file.date_str}`",
+        f"- 旧文件销售数据截止日期: `{old_file.date_str}`",
         "",
         "## SKU 覆盖情况",
         "",
@@ -225,42 +179,22 @@ def generate_report(old_file: ForecastFile, new_file: ForecastFile, top_n: int) 
         "",
         "## 重合 SKU 总体差异",
         "",
-        f"- 纳入差异分析的重合 SKU 数: **{len(sku_diffs)}**",
-        f"- 发生预测变化的 SKU 数: **{changed_count}**",
-        f"- 重合 SKU 在共同月份上的 `{old_file.date_str}` 预测总量: **{format_number(old_total_shared)}**",
-        f"- 重合 SKU 在共同月份上的 `{new_file.date_str}` 预测总量: **{format_number(new_total_shared)}**",
-        f"- 总差值: **{format_number(new_total_shared - old_total_shared)}**",
-        f"- 总体变化幅度: **{safe_pct_change(old_total_shared, new_total_shared)}**",
+        f"- 纳入差异分析的重合 SKU 数: **{len(target_month_diffs)}**",
+        f"- 发生预测变化的 SKU 数: **{changed_count_target_month}**",
+        f"- 重合 SKU 在 `{old_file.date_str}` 中 `{target_month}` 月预测总量: **{format_number(old_total_target_month)}**",
+        f"- 重合 SKU 在 `{new_file.date_str}` 中 `{target_month}` 月预测总量: **{format_number(new_total_target_month)}**",
+        f"- 总差值: **{format_number(new_total_target_month - old_total_target_month)}**",
+        f"- 总体变化幅度: **{safe_pct_change(old_total_target_month, new_total_target_month)}**",
         f"- 单 SKU 平均绝对变化量: **{format_number(avg_abs_delta)}**",
         f"- 单 SKU 绝对变化量中位数: **{format_number(median_abs_delta)}**",
-        "",
-        "## 共同月份汇总",
-        "",
-        f"| 月份 | 重合 SKU 数 | {old_file.date_str} 预测总量 | {new_file.date_str} 预测总量 | 差值 | 变化幅度 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
 
-    if month_summary:
-        for row in month_summary:
-            report_lines.append(
-                f"| {row['month']} | {row['sku_count']} | {format_number(row['old_total'])} | "
-                f"{format_number(row['new_total'])} | {format_number(row['delta'])} | {row['pct_change']} |"
-            )
-    else:
-        report_lines.append("| - | - | - | - | - | - |")
-
     report_lines.append("")
-    report_lines.extend(render_rank_table(top_increase, f"重合 SKU 增幅 Top {top_n}", old_file.date_str, new_file.date_str))
-    report_lines.extend(render_rank_table(top_decrease, f"重合 SKU 降幅 Top {top_n}", old_file.date_str, new_file.date_str))
-
     report_lines.extend(
-        [
-            "## 非重合 SKU",
-            "",
-            f"- 仅 `{new_file.date_str}` 存在的 SKU 示例: {', '.join(new_only[:20]) if new_only else '无'}",
-            f"- 仅 `{old_file.date_str}` 存在的 SKU 示例: {', '.join(old_only[:20]) if old_only else '无'}",
-            "",
-        ]
+        render_rank_table(top_increase, f"重合 SKU 增幅 Top {top_n}", old_file.date_str, new_file.date_str, target_month)
+    )
+    report_lines.extend(
+        render_rank_table(top_decrease, f"重合 SKU 降幅 Top {top_n}", old_file.date_str, new_file.date_str, target_month)
     )
 
     report_name = f"{new_file.date_str}_{old_file.date_str}_diff_report.md"
