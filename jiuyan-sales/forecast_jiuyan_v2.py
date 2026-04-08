@@ -54,6 +54,16 @@ DEFAULT_HORIZON = 12
 DEFAULT_MIN_MONTHS = 12
 CHUNK_SIZE = 200  # 每批次处理的 SKU 数量，防止内存溢出
 
+
+def build_default_output_path(
+    output_dir: Path,
+    latest_sale_ts: pd.Timestamp | None,
+) -> Path:
+    """按实际销售截止日期生成默认 JSON 文件名。"""
+    if latest_sale_ts is None:
+        return output_dir / "jiuyan_forecasts.json"
+    return output_dir / f"jiuyan_forecasts_{latest_sale_ts.strftime('%Y%m%d')}.json"
+
 def fetch_daily_sales(db_path: str, sku: str, end_date: str, days: int = 400) -> np.ndarray:
     """从 sales 表抓取指定 SKU 的日销量背景。"""
     conn = sqlite3.connect(db_path)
@@ -399,10 +409,9 @@ def main() -> None:
     )
     output_dir = Path(__file__).parent / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    default_output = output_dir / "jiuyan_forecasts.json"
     parser.add_argument(
-        "-o", "--output", type=str, default=str(default_output),
-        help=f"输出文件路径 (默认 {default_output})",
+        "-o", "--output", type=str, default=None,
+        help="输出文件路径 (默认按最新销售流水日期命名: outputs/jiuyan_forecasts_YYYYMMDD.json)",
     )
     parser.add_argument(
         "--format", choices=["json", "csv"], default=None,
@@ -426,11 +435,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 推断输出格式
-    out_format = args.format
-    if not out_format:
-        out_format = "csv" if args.output.endswith(".csv") else "json"
-
     sku_filter = None
     if args.skus:
         sku_filter = [s.strip() for s in args.skus.split(",")]
@@ -449,6 +453,14 @@ def main() -> None:
         refine=args.refine,
         daily_days=args.daily_days,
     )
+
+    if args.output is None:
+        args.output = str(build_default_output_path(output_dir, latest_sale_ts))
+
+    # 推断输出格式
+    out_format = args.format
+    if not out_format:
+        out_format = "csv" if Path(args.output).suffix.lower() == ".csv" else "json"
 
     # 2. 系统预检
     if not args.skip_check:

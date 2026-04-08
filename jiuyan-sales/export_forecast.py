@@ -23,7 +23,7 @@ JIUYAN_ROOT = REPO_ROOT.parent / "jiuyan"
 # --- Configuration ---
 DB_PATH = JIUYAN_ROOT / "sales_filtered_database" / "sales_filtered.sqlite"
 OUTPUT_DIR = BASE_DIR / "outputs"
-FORECAST_JSON_PATH = OUTPUT_DIR / "jiuyan_forecasts.json"
+LEGACY_FORECAST_JSON_PATH = OUTPUT_DIR / "jiuyan_forecasts.json"
 TARGET_CATEGORIES = ["线组", "鱼钩", "加长子线", "无结子线"]
 HISTORY_START_YEAR = 2024
 INVENTORY_PLAN_TURNOVER_DAYS = 45
@@ -123,6 +123,34 @@ def load_forecast_json(filepath):
         raise ValueError(f"预测文件中没有可用 months: {filepath}")
 
     return display_forecast_keys, forecast_map
+
+
+def build_dated_forecast_json_path(latest_date_str):
+    latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
+    return OUTPUT_DIR / f"jiuyan_forecasts_{latest_date.strftime('%Y%m%d')}.json"
+
+
+def resolve_forecast_json_path(explicit_path, latest_date_str):
+    if explicit_path:
+        return Path(explicit_path)
+
+    candidates = []
+    if latest_date_str:
+        candidates.append(build_dated_forecast_json_path(latest_date_str))
+    candidates.append(LEGACY_FORECAST_JSON_PATH)
+    candidates.extend(sorted(OUTPUT_DIR.glob("jiuyan_forecasts_*.json"), reverse=True))
+
+    seen = set()
+    for candidate in candidates:
+        candidate = Path(candidate)
+        candidate_key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
 
 def inject_cached_values_for_numbers(filepath, sheet_formula_caches):
     """
@@ -329,15 +357,10 @@ def export_forecast(
     sku_scope_file=None,
     cutoff_date_str=None,
     output_prefix="ai-forecast",
-    forecast_json_path=FORECAST_JSON_PATH,
+    forecast_json_path=None,
     forecast_months=DEFAULT_FORECAST_MONTHS,
 ):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    display_forecast_keys, forecast_json_map = load_forecast_json(forecast_json_path)
-    max_forecast_months = len(display_forecast_keys)
-    effective_forecast_months = max(1, min(int(forecast_months), max_forecast_months))
-    display_forecast_keys = display_forecast_keys[:effective_forecast_months]
 
     conn = sqlite3.connect(DB_PATH)
     ensure_inventory_snapshot_column(conn)
@@ -354,6 +377,12 @@ def export_forecast(
         conn.close()
         print("❌ 数据库中没有销售数据项。")
         return None
+
+    forecast_json_path = resolve_forecast_json_path(forecast_json_path, latest_date_str)
+    display_forecast_keys, forecast_json_map = load_forecast_json(forecast_json_path)
+    max_forecast_months = len(display_forecast_keys)
+    effective_forecast_months = max(1, min(int(forecast_months), max_forecast_months))
+    display_forecast_keys = display_forecast_keys[:effective_forecast_months]
 
     latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
     base_year = latest_date.year
@@ -853,7 +882,7 @@ def export_forecast(
             ("销售数据截止日期：", latest_date_str, ""),
             ("库存快照时间：", inventory_latest_update_display, inventory_snapshot_note),
             ("库存计划量可周转（天）：", INVENTORY_PLAN_TURNOVER_DAYS, "手动调整后会自动更新关联值"),
-            ("AI 预测周期（月）：", len(display_forecast_keys), f"默认 {DEFAULT_FORECAST_MONTHS} 个月，可在导出前配置，最多不超过 jiuyan_forecasts.json"),
+            ("AI 预测周期（月）：", len(display_forecast_keys), f"默认 {DEFAULT_FORECAST_MONTHS} 个月，可在导出前配置，最多不超过当前预测 JSON"),
             ("产品分类：", included_categories, ""),
             ("SKU 数量：", included_sku_count, ""),
         ],
@@ -1381,12 +1410,12 @@ if __name__ == "__main__":
         "--months",
         type=int,
         default=DEFAULT_FORECAST_MONTHS,
-        help=f"AI 预测导出月数，默认 {DEFAULT_FORECAST_MONTHS}，最多不超过 jiuyan_forecasts.json 中的 months 数量",
+        help=f"AI 预测导出月数，默认 {DEFAULT_FORECAST_MONTHS}，最多不超过预测 JSON 中的 months 数量",
     )
     parser.add_argument(
         "--forecast-json",
-        default=FORECAST_JSON_PATH,
-        help=f"预测结果 JSON 路径，默认 {FORECAST_JSON_PATH}",
+        default=None,
+        help="预测结果 JSON 路径 (默认按最新销售流水日期匹配 jiuyan_forecasts_YYYYMMDD.json)",
     )
     args = parser.parse_args()
     export_forecast(

@@ -50,6 +50,18 @@ if SRC_DIR.exists():
 DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
 DEFAULT_HORIZON = 12
 DEFAULT_MIN_MONTHS = 12
+
+
+def build_default_output_path(
+    output_dir: Path,
+    latest_sale_ts: pd.Timestamp | None,
+) -> Path:
+    """按实际销售截止日期生成默认 JSON 文件名。"""
+    if latest_sale_ts is None:
+        return output_dir / "jiuyan_forecasts.json"
+    return output_dir / f"jiuyan_forecasts_{latest_sale_ts.strftime('%Y%m%d')}.json"
+
+
 CHUNK_SIZE = 200  # 每批次处理的 SKU 数量，防止内存溢出
 
 
@@ -61,13 +73,14 @@ def load_data(
     min_months: int = DEFAULT_MIN_MONTHS,
     sku_filter: list[str] | None = None,
     max_skus: int | None = None,
-) -> tuple[list[np.ndarray], list[str], pd.Timestamp]:
+) -> tuple[list[np.ndarray], list[str], pd.Timestamp, pd.Timestamp | None]:
     """从 SQLite 加载月度 SKU 销量，填充缺失月份，返回 TimesFM 输入格式。
 
     Returns:
         inputs: 每个元素是一个 SKU 的月度销量一维数组
         sku_index: 与 inputs 一一对应的 SKU 编码列表
         last_date: 数据中最后一个月的日期
+        latest_sale_ts: 数据库中最新的销售日期
     """
     if not Path(db_path).exists():
         print(f"🛑 数据库不存在: {db_path}")
@@ -157,7 +170,7 @@ def load_data(
     print(f"   有效 SKU 数: {len(inputs)}")
     print(f"   序列长度: {min(lengths)} ~ {max(lengths)} 月")
 
-    return inputs, sku_index, global_max
+    return inputs, sku_index, global_max, latest_sale_ts
 
 
 # ──────────────────────────────────────────────
@@ -352,10 +365,9 @@ def main() -> None:
     )
     output_dir = Path(__file__).parent / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    default_output = output_dir / "jiuyan_forecasts.json"
     parser.add_argument(
-        "-o", "--output", type=str, default=str(default_output),
-        help=f"输出文件路径 (默认 {default_output})",
+        "-o", "--output", type=str, default=None,
+        help="输出文件路径 (默认按最新销售流水日期命名: outputs/jiuyan_forecasts_YYYYMMDD.json)",
     )
     parser.add_argument(
         "--format", choices=["json", "csv"], default=None,
@@ -371,11 +383,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 推断输出格式
-    out_format = args.format
-    if not out_format:
-        out_format = "csv" if args.output.endswith(".csv") else "json"
-
     sku_filter = None
     if args.skus:
         sku_filter = [s.strip() for s in args.skus.split(",")]
@@ -386,12 +393,20 @@ def main() -> None:
 
     # 1. 加载数据
     print("\n📊 加载数据...")
-    inputs, sku_index, last_date = load_data(
+    inputs, sku_index, last_date, latest_sale_ts = load_data(
         db_path=args.db,
         min_months=args.min_months,
         sku_filter=sku_filter,
         max_skus=args.max_skus,
     )
+
+    if args.output is None:
+        args.output = str(build_default_output_path(output_dir, latest_sale_ts))
+
+    # 推断输出格式
+    out_format = args.format
+    if not out_format:
+        out_format = "csv" if Path(args.output).suffix.lower() == ".csv" else "json"
 
     # 2. 系统预检
     if not args.skip_check:
