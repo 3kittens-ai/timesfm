@@ -165,18 +165,19 @@ def load_data(
 # ──────────────────────────────────────────────
 def run_preflight(num_series: int, context_length: int, horizon: int) -> None:
     """运行系统预检。"""
-    script_dir = Path(__file__).parent / "timesfm-forecasting" / "scripts"
+    script_dir = REPO_ROOT / "timesfm-forecasting" / "scripts"
     sys.path.insert(0, str(script_dir))
 
     try:
-        from check_system import run_checks
+        from check_system import run_checks  # type: ignore
 
         report = run_checks("v2.5")
         if not report.passed:
             print(f"\n🛑 系统预检未通过: {report.verdict_detail}")
             print("   请运行 python timesfm-forecasting/scripts/check_system.py 查看详情")
             sys.exit(1)
-        print(f"   ✅ 系统预检通过 (RAM: {report.ram_gb:.1f} GB)")
+        print(f"   {report.verdict}")
+        print(f"   {report.verdict_detail}")
     except ImportError:
         print("   ⚠️ 跳过系统预检 (check_system 模块不可用)")
     finally:
