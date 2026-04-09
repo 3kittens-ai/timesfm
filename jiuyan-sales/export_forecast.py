@@ -31,6 +31,8 @@ PRODUCTION_LOT_SIZE = 50
 DEFAULT_FORECAST_MONTHS = 12
 DEMAND_SHEET_NAME = "AI 需求预测"
 BOUNDS_SHEET_NAME = "AI 需求预测上下限参考"
+AI_STANDARD_MIN_MONTHS = 12
+AI_SHORT_HISTORY_MIN_MONTHS = 9
 
 
 def ensure_inventory_snapshot_column(conn):
@@ -123,6 +125,197 @@ def load_forecast_json(filepath):
         raise ValueError(f"预测文件中没有可用 months: {filepath}")
 
     return display_forecast_keys, forecast_map
+
+
+def build_short_history_fallback_forecast(
+    display_forecast_keys,
+    base_month_key,
+    base_actual,
+    refined_anchor_monthly,
+    history_avg,
+    days_in_base_month,
+    seasonal_factor_by_month=None,
+):
+    anchor_monthly = max(
+        float(base_actual or 0),
+        float(refined_anchor_monthly or 0),
+        float(history_avg or 0),
+    )
+    anchor_daily = (anchor_monthly / days_in_base_month) if days_in_base_month and anchor_monthly > 0 else 0.0
+
+    fallback = {}
+    for forecast_key in display_forecast_keys:
+        forecast_year, forecast_month = map(int, forecast_key.split("-"))
+        if forecast_key == base_month_key:
+            forecast_qty = anchor_monthly
+        else:
+            seasonal_factor = (seasonal_factor_by_month or {}).get(forecast_month)
+            if seasonal_factor is not None and seasonal_factor > 0:
+                forecast_qty = anchor_monthly * seasonal_factor
+            else:
+                forecast_qty = anchor_daily * get_days_in_month(forecast_year, forecast_month)
+        lower_80 = max(forecast_qty * 0.8, 0.0)
+        upper_80 = max(forecast_qty * 1.2, 0.0)
+        fallback[forecast_key] = {
+            "forecast": float(forecast_qty),
+            "lower_80": float(lower_80),
+            "upper_80": float(upper_80),
+        }
+
+    return fallback
+
+
+def build_group_seasonality_maps(conn, base_month_key: str, base_month_num: int, base_month_is_complete: bool):
+    """基于成熟 SKU 生成同标签/同分类季节系数。"""
+    comparator = "<=" if base_month_is_complete else "<"
+    mature_query = f"""
+        WITH mature_skus AS (
+            SELECT variant_key
+            FROM v_training_base
+            WHERE year_month {comparator} ?
+            GROUP BY variant_key
+            HAVING COUNT(*) >= 12
+        )
+        SELECT
+            COALESCE(d.product_category, '') AS product_category,
+            COALESCE(d.family_tags, '') AS family_tags,
+            CAST(substr(v.year_month, 6, 2) AS INTEGER) AS month_num,
+            AVG(v.monthly_qty) AS avg_qty
+        FROM v_training_base v
+        JOIN mature_skus m ON m.variant_key = v.variant_key
+        LEFT JOIN dim_sku d ON d.sku_code = v.variant_key
+        WHERE v.year_month {comparator} ?
+          AND COALESCE(d.product_category, '') != ''
+        GROUP BY COALESCE(d.product_category, ''), COALESCE(d.family_tags, ''), CAST(substr(v.year_month, 6, 2) AS INTEGER)
+    """
+    rows = conn.execute(mature_query, (base_month_key, base_month_key)).fetchall()
+
+    family_month_avgs = {}
+    category_month_avgs = {}
+    for category, family_tags, month_num, avg_qty in rows:
+        family_month_avgs.setdefault((str(category), str(family_tags)), {})[int(month_num)] = float(avg_qty or 0.0)
+        category_month_avgs.setdefault(str(category), {}).setdefault(int(month_num), []).append(
+            float(avg_qty or 0.0)
+        )
+
+    category_month_avgs = {
+        category: {
+            month_num: (sum(values) / len(values) if values else 0.0)
+            for month_num, values in month_map.items()
+        }
+        for category, month_map in category_month_avgs.items()
+    }
+
+    def to_factor_map(month_avgs):
+        base_avg = float(month_avgs.get(base_month_num, 0.0) or 0.0)
+        if base_avg <= 0:
+            return {}
+        return {
+            month_num: float(avg_qty or 0.0) / base_avg
+            for month_num, avg_qty in month_avgs.items()
+            if float(avg_qty or 0.0) > 0
+        }
+
+    family_factor_map = {
+        key: to_factor_map(month_avgs) for key, month_avgs in family_month_avgs.items()
+    }
+    category_factor_map = {
+        key: to_factor_map(month_avgs) for key, month_avgs in category_month_avgs.items()
+    }
+    global_month_avgs = {}
+    for _, _, month_num, avg_qty in rows:
+        global_month_avgs.setdefault(int(month_num), []).append(float(avg_qty or 0.0))
+    global_month_avgs = {
+        month_num: (sum(values) / len(values) if values else 0.0)
+        for month_num, values in global_month_avgs.items()
+    }
+    global_factor_map = to_factor_map(global_month_avgs)
+
+    return family_factor_map, category_factor_map, global_factor_map
+
+
+def fetch_full_daily_sales(db_path: str, sku: str, end_date: str):
+    """抓取指定 SKU 截止 end_date 的全部日销量历史，缺失日期补 0。"""
+    conn = sqlite3.connect(db_path)
+    query = """
+        SELECT sale_date, SUM(sales_volume) AS daily_vol
+        FROM sales
+        WHERE barcode = ? AND sale_date <= ?
+        GROUP BY sale_date
+        ORDER BY sale_date
+    """
+    df_daily = pd.read_sql(query, conn, params=(sku, end_date))
+    conn.close()
+
+    if df_daily.empty:
+        return []
+
+    df_daily["sale_date"] = pd.to_datetime(df_daily["sale_date"])
+    start_ts = df_daily["sale_date"].min()
+    end_ts = pd.Timestamp(end_date)
+    full_range = pd.date_range(start=start_ts, end=end_ts, freq="D")
+    full_df = pd.DataFrame({"sale_date": full_range})
+    merged = full_df.merge(df_daily, on="sale_date", how="left")
+    return merged["daily_vol"].fillna(0).astype("float32").to_numpy()
+
+
+def build_short_history_current_month_predictions(
+    db_path: str,
+    sku_codes,
+    latest_date,
+    days_in_base_month,
+):
+    """用 TimesFM 日度模式补全短历史 SKU 的当前月剩余天。"""
+    latest_ts = pd.Timestamp(latest_date)
+    remaining_days = max(days_in_base_month - latest_ts.day, 0)
+    actual_so_far_map = {}
+    conn = sqlite3.connect(db_path)
+    try:
+        for sku in sku_codes:
+            actual_so_far = conn.execute(
+                """
+                SELECT COALESCE(SUM(sales_volume), 0)
+                FROM sales
+                WHERE barcode = ? AND sale_date >= ? AND sale_date <= ?
+                """,
+                (sku, latest_ts.strftime("%Y-%m-01"), latest_ts.strftime("%Y-%m-%d")),
+            ).fetchone()[0]
+            actual_so_far_map[str(sku)] = float(actual_so_far or 0)
+    finally:
+        conn.close()
+
+    if remaining_days <= 0 or not sku_codes:
+        return actual_so_far_map
+
+    daily_contexts = []
+    effective_skus = []
+    for sku in sku_codes:
+        daily_series = fetch_full_daily_sales(db_path, str(sku), latest_ts.strftime("%Y-%m-%d"))
+        if len(daily_series) == 0:
+            continue
+        daily_contexts.append(daily_series)
+        effective_skus.append(str(sku))
+
+    if not daily_contexts:
+        return actual_so_far_map
+
+    from forecast_jiuyan import load_model, run_forecast
+
+    max_context = max(len(series) for series in daily_contexts)
+    aligned_context = min(max(64, max_context), 16384)
+    model = load_model(
+        horizon=remaining_days,
+        max_context=aligned_context,
+        batch_size=min(32, len(daily_contexts)),
+    )
+    daily_point, _ = run_forecast(model, daily_contexts, remaining_days)
+
+    refined_map = dict(actual_so_far_map)
+    for idx, sku in enumerate(effective_skus):
+        predicted_remaining = max(float(daily_point[idx].sum()), 0.0)
+        refined_map[sku] = float(actual_so_far_map.get(sku, 0.0)) + predicted_remaining
+
+    return refined_map
 
 
 def build_dated_forecast_json_path(latest_date_str):
@@ -388,6 +581,8 @@ def export_forecast(
     base_year = latest_date.year
     base_month = latest_date.month
     base_month_key = month_key(base_year, base_month)
+    days_in_base_month = get_days_in_month(base_year, base_month)
+    base_month_is_complete = latest_date.day >= days_in_base_month
     inventory_latest_update = pd.read_sql(
         "SELECT MAX(inventory_snapshot_at) AS updated_at FROM dim_sku",
         conn,
@@ -489,6 +684,35 @@ def export_forecast(
     pivot_monthly = df_monthly.pivot(index="barcode", columns="ym", values="qty").fillna(0)
     pivot_dict = pivot_monthly.to_dict(orient="index")
 
+    if not df_skus.empty:
+        sku_codes = df_skus["sku_code"].astype(str).tolist()
+        placeholders = ",".join(["?"] * len(sku_codes))
+        comparator = "<=" if base_month_is_complete else "<"
+        history_stats_rows = conn.execute(
+            f"""
+            SELECT variant_key, COUNT(*) AS complete_months, AVG(monthly_qty) AS avg_complete_qty
+            FROM v_training_base
+            WHERE variant_key IN ({placeholders})
+              AND year_month {comparator} ?
+            GROUP BY variant_key
+            """,
+            [*sku_codes, base_month_key],
+        ).fetchall()
+        history_complete_months_map = {str(sku): int(months or 0) for sku, months, _ in history_stats_rows}
+        history_complete_avg_map = {
+            str(sku): float(avg_qty or 0.0) for sku, _, avg_qty in history_stats_rows
+        }
+    else:
+        history_complete_months_map = {}
+        history_complete_avg_map = {}
+
+    family_seasonality_factor_map, category_seasonality_factor_map, global_seasonality_factor_map = build_group_seasonality_maps(
+        conn=conn,
+        base_month_key=base_month_key,
+        base_month_num=base_month,
+        base_month_is_complete=base_month_is_complete,
+    )
+
     def get_actual_qty(code, ym_key):
         return float(pivot_dict.get(code, {}).get(ym_key, 0.0))
 
@@ -518,10 +742,20 @@ def export_forecast(
 
     conn.close()
 
-    days_in_base_month = get_days_in_month(base_year, base_month)
     days_elapsed = latest_date.day
     remaining_days_in_base_month = max(days_in_base_month - days_elapsed, 0)
     fallback_month = int(display_forecast_keys[-1].split("-")[1])
+    short_history_fallback_skus = [
+        str(code)
+        for code in df_skus["sku_code"].astype(str).tolist()
+        if int(history_complete_months_map.get(str(code), 0)) < AI_SHORT_HISTORY_MIN_MONTHS
+    ]
+    short_history_current_month_map = build_short_history_current_month_predictions(
+        db_path=str(DB_PATH),
+        sku_codes=short_history_fallback_skus,
+        latest_date=latest_date_str,
+        days_in_base_month=days_in_base_month,
+    )
 
     current_remaining_demand_col = f"{base_month}月剩余需求"
     future_demand_cols = [f"{int(ym_key.split('-')[1])}月需求" for ym_key in display_forecast_keys[1:]]
@@ -542,6 +776,7 @@ def export_forecast(
 
         for _, sku in group.iterrows():
             code = sku["sku_code"]
+            complete_history_months = int(history_complete_months_map.get(str(code), 0))
             row = {
                 "商品编码": code,
                 "商品名称": sku["sku_name"],
@@ -581,6 +816,37 @@ def export_forecast(
             row[current_month_ly_col] = ly_forecast
 
             sku_forecasts = forecast_json_map.get(str(code), {})
+            if complete_history_months >= AI_STANDARD_MIN_MONTHS:
+                prediction_source = "AI-标准"
+            elif complete_history_months >= AI_SHORT_HISTORY_MIN_MONTHS:
+                prediction_source = "AI-短历史"
+            else:
+                prediction_source = "短历史兜底"
+
+            if not sku_forecasts:
+                seasonal_factor_by_month = family_seasonality_factor_map.get(
+                    (str(sku["product_category"]), str(sku["family_tags"] or "")),
+                )
+                if not seasonal_factor_by_month:
+                    seasonal_factor_by_month = category_seasonality_factor_map.get(
+                        str(sku["product_category"]),
+                    )
+                if not seasonal_factor_by_month:
+                    seasonal_factor_by_month = global_seasonality_factor_map
+                sku_forecasts = build_short_history_fallback_forecast(
+                    display_forecast_keys=display_forecast_keys,
+                    base_month_key=base_month_key,
+                    base_actual=base_actual,
+                    refined_anchor_monthly=short_history_current_month_map.get(
+                        str(code),
+                        max(float(base_actual or 0), float(mean_forecast or 0), float(window_forecast or 0)),
+                    ),
+                    history_avg=history_complete_avg_map.get(str(code), 0.0),
+                    days_in_base_month=days_in_base_month,
+                    seasonal_factor_by_month=seasonal_factor_by_month,
+                )
+
+            row["预测口径"] = prediction_source
             for forecast_key in display_forecast_keys:
                 row[forecast_key] = sku_forecasts.get(forecast_key, {}).get("forecast", 0.0)
 
@@ -635,6 +901,7 @@ def export_forecast(
             plan_row = {
                 "商品编码": code,
                 "商品名称": sku["sku_name"],
+                "预测口径": prediction_source,
                 "供应商": sku["supplier"],
                 current_remaining_demand_col: current_remaining_demand,
                 current_gap_col: max(math.ceil(current_remaining_demand - inventory_plus_transit), 0),
@@ -776,6 +1043,7 @@ def export_forecast(
     final_cols = [
         "商品编码",
         "商品名称",
+        "预测口径",
         *display_forecast_keys,
         "预测合计",
         *forecast_mom_display_cols,
@@ -838,6 +1106,7 @@ def export_forecast(
     plan_cols = [
         "商品编码",
         "商品名称",
+        "预测口径",
         "供应商",
         current_remaining_demand_col,
         *future_demand_cols,
@@ -892,6 +1161,18 @@ def export_forecast(
         (
             "预测月销量",
             "TimesFM 是 Google 做的一个“通用时间序列基础模型”，可以把它理解成时间序列领域里类似大语言模型的东西：先在大量不同类型的时间序列上预训练，再拿来直接做零样本或少样本预测。最直接影响预测的因素是：历史销量轨迹本身：趋势、季节性、波动、断崖、长尾销量。",
+        ),
+        (
+            "AI-标准",
+            "应用原则：至少 12 个完整月历史时优先使用。计算逻辑：直接采用 TimesFM 月度预测结果；若当前月尚未结束，则首月按 refine 逻辑用“已发生实际销量 + 剩余天日度预测”修正。",
+        ),
+        (
+            "AI-短历史",
+            "应用原则：有 9-11 个完整月历史时使用。计算逻辑：优先采用 TimesFM 月度预测结果；若当前月尚未结束，则首月按“已发生实际销量 + 剩余天日度预测”修正；如果旧预测结果缺失，也沿用同一口径补齐并保持为 AI-短历史。",
+        ),
+        (
+            "短历史兜底",
+            "应用原则：不足 9 个完整月历史时使用。计算逻辑：当月按“已发生实际销量 + TimesFM 日度预测剩余天”计算，并尽量使用该 SKU 全部已有日历史销量记录；后续月份优先参考同 family_tags 的成熟 SKU 季节趋势，找不到则退回同产品分类，再退回全 SKU 季节趋势，仍找不到再按该当月锚点折算日均后外推。",
         ),
         (
             "当前月预测（本月均值参考）",

@@ -51,7 +51,7 @@ if SRC_DIR.exists():
 # ──────────────────────────────────────────────
 DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
 DEFAULT_HORIZON = 12
-DEFAULT_MIN_MONTHS = 12
+DEFAULT_MIN_MONTHS = 9
 CHUNK_SIZE = 200  # 每批次处理的 SKU 数量，防止内存溢出
 
 
