@@ -5,7 +5,7 @@ from pathlib import Path
 # Paths
 RESULTS_PATH = Path("outputs/backtest/timesfm_backtest_2.5_xreg_v4_results.csv")
 PIVOT_PATH = Path("outputs/timesfm_forecast_12m_pivot_xreg_v4.csv")
-DB_PATH = Path("/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite")
+DB_PATH = Path("/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite")
 
 def update_pivot():
     print(f"Loading results from {RESULTS_PATH}...")

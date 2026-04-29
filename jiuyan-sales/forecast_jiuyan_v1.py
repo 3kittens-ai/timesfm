@@ -47,7 +47,7 @@ if SRC_DIR.exists():
 # ──────────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────────
-DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
+DB_PATH = "/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite"
 DEFAULT_HORIZON = 12
 DEFAULT_MIN_MONTHS = 12
 

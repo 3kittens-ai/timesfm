@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
+DB_PATH = "/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite"
 CHUNK_SIZE = 200
 
 def load_backtest_data(

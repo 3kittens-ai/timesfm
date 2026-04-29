@@ -9,9 +9,9 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 # 配置
-DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
-TARGET_SKUS_PATH = "/Users/andychan/Documents/timesfm/jiuyan-sales/outputs/backtest/target_skus.txt"
-OUTPUT_PATH = "/Users/andychan/Documents/timesfm/jiuyan-sales/outputs/backtest/march_progress_results.json"
+DB_PATH = "/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite"
+TARGET_SKUS_PATH = "/Users/jiandang/Documents/Jiuyan/timesfm/jiuyan-sales/outputs/backtest/target_skus.txt"
+OUTPUT_PATH = "/Users/jiandang/Documents/Jiuyan/timesfm/jiuyan-sales/outputs/backtest/march_progress_results.json"
 DAILY_CONTEXT_DAYS = 400
 CHUNK_SIZE = 200
 

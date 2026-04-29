@@ -5,7 +5,7 @@ import os
 
 # Paths
 RESULTS_PATH = Path("outputs/backtest/timesfm_backtest_2.5_xreg_v4_results.csv")
-DB_PATH = Path("/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite")
+DB_PATH = Path("/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite")
 OUTPUT_MD = Path("outputs/backtest/backtest_2.5_summary.md")
 
 def generate_report():

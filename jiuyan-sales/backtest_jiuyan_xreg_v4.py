@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-DB_PATH = "/Users/andychan/Documents/jiuyan/sales_filtered_database/sales_filtered.sqlite"
+DB_PATH = "/Users/jiandang/Documents/Jiuyan/jiuyan-data/sales_filtered_database/sales_filtered.sqlite"
 CHUNK_SIZE = 50 
 
 FEATURE_SETS = {
@@ -264,7 +264,7 @@ def main():
     point = np.maximum(point, 0)
     
     default_file = (
-        Path("/Users/andychan/Documents/timesfm/jiuyan-sales/outputs/backtest")
+        Path("/Users/jiandang/Documents/Jiuyan/timesfm/jiuyan-sales/outputs/backtest")
         / f"timesfm_backtest_2.5_xreg_v4_{args.feature_set}_results.csv"
     )
     out_file = Path(args.file) if args.file else default_file
