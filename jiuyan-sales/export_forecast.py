@@ -18,7 +18,7 @@ from openpyxl.workbook.properties import CalcProperties
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
-JIUYAN_ROOT = REPO_ROOT.parent / "jiuyan"
+JIUYAN_ROOT = REPO_ROOT.parent / "jiuyan-data"
 
 # --- Configuration ---
 DB_PATH = JIUYAN_ROOT / "sales_filtered_database" / "sales_filtered.sqlite"
@@ -52,6 +52,19 @@ def read_skus_from_file(filepath):
 
     if file_path.suffix.lower() in {".xlsx", ".xls"}:
         df_scope = pd.read_excel(file_path)
+        normalized_columns = {
+            str(column).strip().lower().replace("_", "").replace(" ", "")
+            for column in df_scope.columns
+        }
+        candidate_keys = ["商品编码", "sku_code", "sku", "barcode", "编码"]
+        if not any(
+            key.strip().lower().replace("_", "").replace(" ", "") in normalized_columns
+            for key in candidate_keys
+        ):
+            try:
+                df_scope = pd.read_excel(file_path, sheet_name="SKU范围")
+            except ValueError:
+                pass
     else:
         df_scope = pd.read_csv(file_path)
 
