@@ -26,13 +26,26 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 LEGACY_FORECAST_JSON_PATH = OUTPUT_DIR / "jiuyan_forecasts.json"
 TARGET_CATEGORIES = ["线组", "鱼钩", "加长子线", "无结子线"]
 HISTORY_START_YEAR = 2024
-INVENTORY_PLAN_TURNOVER_DAYS = 45
+INVENTORY_PLAN_TURNOVER_DAYS = 75
 PRODUCTION_LOT_SIZE = 50
 DEFAULT_FORECAST_MONTHS = 12
 DEMAND_SHEET_NAME = "AI 需求预测"
 BOUNDS_SHEET_NAME = "AI 需求预测上下限参考"
 AI_STANDARD_MIN_MONTHS = 12
 AI_SHORT_HISTORY_MIN_MONTHS = 9
+MARKETING_UPLIFT_ENABLED = True
+MARKETING_SYSTEMATIC_UNDERESTIMATE_FLOOR = 0.04
+MARKETING_GROWTH_14D_MULTIPLIER = 1.50
+MARKETING_BASE_UPLIFT_CAP = 0.55
+MARKETING_ACCELERATING_BONUS = 0.10
+MARKETING_TOP10_POSITIVE_GROWTH_UPLIFT = 0.08
+MARKETING_TOP10_NON_POSITIVE_GROWTH_UPLIFT = 0.03
+MARKETING_TOP10_MIN_TOTAL_UPLIFT = 0.08
+MARKETING_TOTAL_UPLIFT_CAP = 0.65
+MARKETING_SKU_MIX_RECENT14_ALPHA = 0.65
+MARKETING_GROWTH_7D_MIN_BASE = 30
+MARKETING_GROWTH_14D_MIN_BASE = 50
+MARKETING_UPLIFT_ACTIVE_MONTH_OFFSETS = {0}  # 只修正当前预测月，避免跨季节误抬远月需求
 
 
 def ensure_inventory_snapshot_column(conn):
@@ -340,23 +353,14 @@ def resolve_forecast_json_path(explicit_path, latest_date_str):
     if explicit_path:
         return Path(explicit_path)
 
-    candidates = []
-    if latest_date_str:
-        candidates.append(build_dated_forecast_json_path(latest_date_str))
-    candidates.append(LEGACY_FORECAST_JSON_PATH)
-    candidates.extend(sorted(OUTPUT_DIR.glob("jiuyan_forecasts_*.json"), reverse=True))
+    expected_path = build_dated_forecast_json_path(latest_date_str)
+    if expected_path.exists():
+        return expected_path
 
-    seen = set()
-    for candidate in candidates:
-        candidate = Path(candidate)
-        candidate_key = str(candidate.resolve()) if candidate.exists() else str(candidate)
-        if candidate_key in seen:
-            continue
-        seen.add(candidate_key)
-        if candidate.exists():
-            return candidate
-
-    return candidates[0]
+    raise FileNotFoundError(
+        f"未找到最新预测 JSON: {expected_path}。请先运行 forecast_jiuyan.py 生成本次 AI 预测结果，"
+        "或用 --forecast-json 显式指定要导出的预测 JSON。"
+    )
 
 def inject_cached_values_for_numbers(filepath, sheet_formula_caches):
     """
@@ -442,6 +446,8 @@ def ceil_number(value):
 def format_pct(value):
     if value is None or pd.isna(value):
         return ""
+    if isinstance(value, str):
+        return value if value.endswith("%") else value
     return f"{math.ceil(float(value))}%"
 
 
@@ -449,6 +455,180 @@ def ceil_to_multiple(value, multiple):
     if value <= 0:
         return 0
     return int(math.ceil(float(value) / multiple) * multiple)
+
+
+def clip_number(value, lower, upper):
+    return min(max(float(value), lower), upper)
+
+
+def build_family_name(category, tags):
+    return f"[{category}] {tags if tags else ''}".strip()
+
+
+def build_marketing_uplift_context(df_skus, df_daily, latest_date):
+    if df_skus.empty or df_daily.empty:
+        return {}, {}
+
+    sku_family = df_skus[["sku_code", "product_category", "family_tags"]].copy()
+    sku_family["sku_code"] = sku_family["sku_code"].astype(str)
+    sku_family["family_name"] = sku_family.apply(
+        lambda row: build_family_name(row["product_category"], row["family_tags"]), axis=1
+    )
+
+    daily = df_daily.copy()
+    daily["barcode"] = daily["barcode"].astype(str)
+    daily = daily.merge(sku_family[["sku_code", "family_name"]], left_on="barcode", right_on="sku_code", how="inner")
+    if daily.empty:
+        return {}, {}
+
+    latest_ts = pd.Timestamp(latest_date.date())
+
+    def window_sum(start_days_ago, end_days_ago=0):
+        start_date = latest_ts - pd.Timedelta(days=start_days_ago)
+        end_date = latest_ts - pd.Timedelta(days=end_days_ago)
+        return daily[(daily["sale_date_dt"] >= start_date) & (daily["sale_date_dt"] <= end_date)]
+
+    family = sku_family[["family_name"]].drop_duplicates().copy()
+    windows = {
+        "last7_qty": window_sum(6),
+        "prev7_qty": window_sum(13, 7),
+        "last14_qty": window_sum(13),
+        "prev14_qty": window_sum(27, 14),
+        "last30_qty": window_sum(29),
+    }
+    for column, frame in windows.items():
+        grouped = frame.groupby("family_name", as_index=False)["qty"].sum().rename(columns={"qty": column})
+        family = family.merge(grouped, on="family_name", how="left")
+        family[column] = family[column].fillna(0)
+
+    family["growth_7d_valid"] = family["prev7_qty"] >= MARKETING_GROWTH_7D_MIN_BASE
+    family["growth_14d_valid"] = family["prev14_qty"] >= MARKETING_GROWTH_14D_MIN_BASE
+    family["growth_7d"] = family.apply(
+        lambda row: row["last7_qty"] / row["prev7_qty"] - 1 if row["growth_7d_valid"] else 0,
+        axis=1,
+    )
+    family["growth_14d"] = family.apply(
+        lambda row: row["last14_qty"] / row["prev14_qty"] - 1 if row["growth_14d_valid"] else 0,
+        axis=1,
+    )
+    family["rank_last30"] = family["last30_qty"].rank(method="first", ascending=False)
+    family["top10_flag"] = family["rank_last30"] <= 10
+    family["base_uplift"] = family["growth_14d"].apply(
+        lambda value: clip_number(value * MARKETING_GROWTH_14D_MULTIPLIER, 0, MARKETING_BASE_UPLIFT_CAP)
+    )
+    accelerating = (family["growth_14d"] > 0.20) & family["growth_7d_valid"] & (family["growth_7d"] > 0.20)
+    family.loc[accelerating, "base_uplift"] = family.loc[accelerating, "base_uplift"] + MARKETING_ACCELERATING_BONUS
+    family["top10_uplift"] = family.apply(
+        lambda row: (
+            MARKETING_TOP10_POSITIVE_GROWTH_UPLIFT
+            if row["top10_flag"] and row["growth_14d"] > 0
+            else MARKETING_TOP10_NON_POSITIVE_GROWTH_UPLIFT if row["top10_flag"] else 0
+        ),
+        axis=1,
+    )
+    positive_marketing_signal = (
+        family["top10_flag"]
+        | (family["growth_14d_valid"] & (family["growth_14d"] > 0))
+        | (family["growth_7d_valid"] & (family["growth_7d"] > 0))
+    )
+    family["systematic_floor_uplift"] = 0.0
+    family.loc[positive_marketing_signal, "systematic_floor_uplift"] = MARKETING_SYSTEMATIC_UNDERESTIMATE_FLOOR
+    family["total_uplift"] = family["base_uplift"] + family["top10_uplift"] + family["systematic_floor_uplift"]
+    family.loc[family["top10_flag"], "total_uplift"] = family.loc[family["top10_flag"], "total_uplift"].clip(
+        lower=MARKETING_TOP10_MIN_TOTAL_UPLIFT
+    )
+    family["total_uplift"] = family["total_uplift"].clip(lower=0, upper=MARKETING_TOTAL_UPLIFT_CAP)
+
+    recent14_by_sku = window_sum(13).groupby("barcode")["qty"].sum().to_dict()
+    return family.set_index("family_name").to_dict(orient="index"), {
+        str(key): float(value) for key, value in recent14_by_sku.items()
+    }
+
+
+def resolve_last_complete_month_range(latest_date):
+    latest_ts = pd.Timestamp(latest_date)
+    if latest_ts.day >= get_days_in_month(latest_ts.year, latest_ts.month):
+        target_year, target_month = latest_ts.year, latest_ts.month
+    else:
+        target_year, target_month = get_prev_ym(latest_ts.year, latest_ts.month)
+    start_date = f"{target_year:04d}-{target_month:02d}-01"
+    end_date = f"{target_year:04d}-{target_month:02d}-{get_days_in_month(target_year, target_month):02d}"
+    return start_date, end_date
+
+
+def fetch_top_sku_scope_codes(conn, latest_date, top_n):
+    start_date, end_date = resolve_last_complete_month_range(latest_date)
+    df_top = pd.read_sql(
+        f"""
+        SELECT s.barcode AS sku_code, SUM(s.sales_volume) AS sales_volume
+        FROM sales s
+        LEFT JOIN dim_sku d ON d.sku_code = s.barcode
+        WHERE s.sale_date >= ?
+          AND s.sale_date <= ?
+          AND COALESCE(d.product_category, s.product_category) IN ({",".join(["?"] * len(TARGET_CATEGORIES))})
+        GROUP BY s.barcode
+        ORDER BY sales_volume DESC, s.barcode
+        LIMIT ?
+        """,
+        conn,
+        params=[start_date, end_date, *TARGET_CATEGORIES, int(top_n)],
+    )
+    return set(df_top["sku_code"].astype(str)), start_date[:7]
+
+
+def month_offset_from_base(forecast_key, base_month_key):
+    forecast_year, forecast_month = map(int, forecast_key.split("-"))
+    base_year, base_month = map(int, base_month_key.split("-"))
+    return (forecast_year * 12 + forecast_month) - (base_year * 12 + base_month)
+
+
+def apply_marketing_uplift_to_ai_group_rows(group_rows, group_bounds_rows, family_name, display_forecast_keys, base_month_key, uplift_context, recent14_by_sku):
+    if not MARKETING_UPLIFT_ENABLED or not group_rows:
+        return
+
+    total_uplift = float((uplift_context.get(family_name) or {}).get("total_uplift", 0) or 0)
+    product_recent14_qty = sum(float(recent14_by_sku.get(str(row["商品编码"]), 0) or 0) for row in group_rows)
+
+    for forecast_key in display_forecast_keys:
+        month_offset = month_offset_from_base(forecast_key, base_month_key)
+        if month_offset not in MARKETING_UPLIFT_ACTIVE_MONTH_OFFSETS or total_uplift <= 0:
+            continue
+        effective_uplift = total_uplift
+
+        product_base_forecast = sum(max(float(row.get(forecast_key, 0) or 0), 0) for row in group_rows)
+        if product_base_forecast <= 0:
+            continue
+
+        product_adjusted_forecast = product_base_forecast * (1 + effective_uplift)
+        mix_shares = []
+        for row in group_rows:
+            code = str(row["商品编码"])
+            base_qty = max(float(row.get(forecast_key, 0) or 0), 0)
+            base_share = base_qty / product_base_forecast
+            recent14_qty = float(recent14_by_sku.get(code, 0) or 0)
+            recent14_share = recent14_qty / product_recent14_qty if product_recent14_qty > 0 else base_share
+            mix_share = (1 - MARKETING_SKU_MIX_RECENT14_ALPHA) * base_share + MARKETING_SKU_MIX_RECENT14_ALPHA * recent14_share
+            mix_shares.append(mix_share)
+
+        share_sum = sum(mix_shares)
+        if share_sum <= 0:
+            continue
+
+        for row, bounds_row, mix_share in zip(group_rows, group_bounds_rows, mix_shares):
+            old_forecast = float(row.get(forecast_key, 0) or 0)
+            new_forecast = max(product_adjusted_forecast * mix_share / share_sum, 0)
+            row[forecast_key] = new_forecast
+            bounds_row[f"{forecast_key}__forecast"] = new_forecast
+            if old_forecast > 0:
+                ratio = new_forecast / old_forecast
+                bounds_row[f"{forecast_key}__lower_80"] = max(float(bounds_row.get(f"{forecast_key}__lower_80", 0) or 0) * ratio, 0)
+                bounds_row[f"{forecast_key}__upper_80"] = max(float(bounds_row.get(f"{forecast_key}__upper_80", 0) or 0) * ratio, 0)
+            else:
+                bounds_row[f"{forecast_key}__lower_80"] = max(new_forecast * 0.8, 0)
+                bounds_row[f"{forecast_key}__upper_80"] = max(new_forecast * 1.2, 0)
+
+    for row in group_rows:
+        row["预测合计"] = sum(row.get(ym_key, 0) for ym_key in display_forecast_keys)
 
 
 def calc_turnover_display(quantity, periods, fallback_month):
@@ -561,12 +741,19 @@ def build_inventory_plan_formula(total_quantity_ref, current_daily_expr, future_
 
 def export_forecast(
     sku_scope_file=None,
+    sku_scope_top_n=None,
     cutoff_date_str=None,
     output_prefix="ai-forecast",
     forecast_json_path=None,
     forecast_months=DEFAULT_FORECAST_MONTHS,
+    inventory_plan_turnover_days=INVENTORY_PLAN_TURNOVER_DAYS,
 ):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    inventory_plan_turnover_days = int(inventory_plan_turnover_days)
+    if sku_scope_top_n is not None:
+        sku_scope_top_n = int(sku_scope_top_n)
+        if sku_scope_top_n <= 0:
+            raise ValueError("sku_scope_top_n 必须是正整数")
 
     conn = sqlite3.connect(DB_PATH)
     ensure_inventory_snapshot_column(conn)
@@ -584,16 +771,19 @@ def export_forecast(
         print("❌ 数据库中没有销售数据项。")
         return None
 
-    forecast_json_path = resolve_forecast_json_path(forecast_json_path, latest_date_str)
-    display_forecast_keys, forecast_json_map = load_forecast_json(forecast_json_path)
-    max_forecast_months = len(display_forecast_keys)
-    effective_forecast_months = max(1, min(int(forecast_months), max_forecast_months))
-    display_forecast_keys = display_forecast_keys[:effective_forecast_months]
-
     latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
     base_year = latest_date.year
     base_month = latest_date.month
     base_month_key = month_key(base_year, base_month)
+    forecast_json_path = resolve_forecast_json_path(forecast_json_path, latest_date_str)
+    display_forecast_keys, forecast_json_map = load_forecast_json(forecast_json_path)
+    display_forecast_keys = [ym_key for ym_key in display_forecast_keys if ym_key >= base_month_key]
+    if not display_forecast_keys:
+        conn.close()
+        raise ValueError(f"预测 JSON 中没有 {base_month_key} 及之后的月份: {forecast_json_path}")
+    max_forecast_months = len(display_forecast_keys)
+    effective_forecast_months = max(1, min(int(forecast_months), max_forecast_months))
+    display_forecast_keys = display_forecast_keys[:effective_forecast_months]
     days_in_base_month = get_days_in_month(base_year, base_month)
     base_month_is_complete = latest_date.day >= days_in_base_month
     inventory_latest_update = pd.read_sql(
@@ -642,11 +832,28 @@ def export_forecast(
     df_skus["finished_inventory"] = df_skus["finished_inventory"].fillna(0)
     df_skus["purchase_in_transit"] = df_skus["purchase_in_transit"].fillna(0)
     df_skus["inventory_snapshot_at"] = df_skus["inventory_snapshot_at"].fillna("")
+    df_marketing_skus = df_skus.copy()
 
     if sku_scope_file:
         df_scope = read_skus_from_file(sku_scope_file)
         scope_codes = set(df_scope["sku_code"].astype(str))
         df_skus = df_skus[df_skus["sku_code"].astype(str).isin(scope_codes)].copy()
+
+    sku_scope_top_note = ""
+    if sku_scope_top_n is not None:
+        top_scope_codes, top_scope_month = fetch_top_sku_scope_codes(conn, latest_date, sku_scope_top_n)
+        df_skus = df_skus[df_skus["sku_code"].astype(str).isin(top_scope_codes)].copy()
+        sku_scope_top_note = f"按 {top_scope_month} 销量 Top {int(sku_scope_top_n)} SKU 过滤"
+
+    if df_skus.empty:
+        conn.close()
+        scope_parts = []
+        if sku_scope_file:
+            scope_parts.append(f"范围文件: {sku_scope_file}")
+        if sku_scope_top_n is not None:
+            scope_parts.append(f"Top {int(sku_scope_top_n)} SKU")
+        scope_desc = "；".join(scope_parts) if scope_parts else "目标品类"
+        raise ValueError(f"SKU 范围为空：{scope_desc} 没有匹配到可导出的 SKU")
 
     if not df_skus.empty:
         sku_codes = df_skus["sku_code"].astype(str).tolist()
@@ -734,7 +941,7 @@ def export_forecast(
 
     lookback_months = [month_key(*add_months(base_year, base_month, -i)) for i in range(1, 13)]
 
-    start_window = (latest_date - timedelta(days=14)).strftime("%Y-%m-%d")
+    start_window = (latest_date - timedelta(days=29)).strftime("%Y-%m-%d")
     df_daily = pd.read_sql(
         """
         SELECT sale_date, barcode, SUM(sales_volume) AS qty
@@ -748,10 +955,16 @@ def export_forecast(
     if not df_daily.empty:
         df_daily["sale_date_dt"] = pd.to_datetime(df_daily["sale_date"])
         daily_7 = df_daily[df_daily["sale_date_dt"] >= (latest_date - timedelta(days=6))].groupby("barcode")["qty"].sum()
-        daily_15 = df_daily.groupby("barcode")["qty"].sum()
+        daily_15 = df_daily[df_daily["sale_date_dt"] >= (latest_date - timedelta(days=14))].groupby("barcode")["qty"].sum()
     else:
         daily_7 = pd.Series(dtype="float64")
         daily_15 = pd.Series(dtype="float64")
+
+    marketing_uplift_context, marketing_recent14_by_sku = build_marketing_uplift_context(
+        df_marketing_skus,
+        df_daily,
+        latest_date,
+    )
 
     conn.close()
 
@@ -905,10 +1118,10 @@ def export_forecast(
             inventory_plus_transit_meets = (
                 "是"
                 if isinstance(inventory_plus_transit_turnover, str)
-                or inventory_plus_transit_turnover >= INVENTORY_PLAN_TURNOVER_DAYS
+                or inventory_plus_transit_turnover >= inventory_plan_turnover_days
                 else "否"
             )
-            qty_for_target_days = quantity_for_target_days(INVENTORY_PLAN_TURNOVER_DAYS, periods)
+            qty_for_target_days = quantity_for_target_days(inventory_plan_turnover_days, periods)
             inventory_plan_qty = ceil_to_multiple(max(qty_for_target_days - inventory_plus_transit, 0), PRODUCTION_LOT_SIZE)
 
             plan_row = {
@@ -949,6 +1162,94 @@ def export_forecast(
             group_rows.append(row)
             plan_results.append(plan_row)
             group_bounds_rows.append(bounds_row)
+
+        if MARKETING_UPLIFT_ENABLED:
+            apply_marketing_uplift_to_ai_group_rows(
+                group_rows,
+                group_bounds_rows,
+                family_name,
+                display_forecast_keys,
+                base_month_key,
+                marketing_uplift_context,
+                marketing_recent14_by_sku,
+            )
+            for row in group_rows:
+                for mom_key in forecast_mom_keys:
+                    mom_year, mom_month = map(int, mom_key.split("-"))
+                    prev_mom_year, prev_mom_month = get_prev_ym(mom_year, mom_month)
+                    prev_mom_key = month_key(prev_mom_year, prev_mom_month)
+                    row[f"{mom_key}环比(%)"] = safe_div_pct(row.get(mom_key, 0), row.get(prev_mom_key, 0))
+
+            if group_rows:
+                del plan_results[-len(group_rows):]
+
+            for row, (_, sku) in zip(group_rows, group.iterrows()):
+                on_hand_inventory = float(sku["effective_finished_inventory"] or 0)
+                in_transit_inventory = float(sku["purchase_in_transit"] or 0)
+                inventory_plus_transit = on_hand_inventory + in_transit_inventory
+                current_remaining_demand = math.ceil(
+                    row[base_month_key] / days_in_base_month * remaining_days_in_base_month if days_in_base_month else 0
+                )
+                future_demands = [math.ceil(row.get(ym_key, 0)) for ym_key in display_forecast_keys[1:]]
+                future_daily_usage = [
+                    row.get(ym_key, 0) / get_days_in_month(*map(int, ym_key.split("-")))
+                    for ym_key in display_forecast_keys[1:]
+                ]
+
+                periods = [
+                    {
+                        "label": current_remaining_demand_col,
+                        "days": remaining_days_in_base_month,
+                        "daily_rate": row[base_month_key] / days_in_base_month if days_in_base_month else 0,
+                    }
+                ]
+                for ym_key in display_forecast_keys[1:]:
+                    forecast_year, forecast_month = map(int, ym_key.split("-"))
+                    periods.append(
+                        {
+                            "label": ym_key,
+                            "days": get_days_in_month(forecast_year, forecast_month),
+                            "daily_rate": row.get(ym_key, 0) / get_days_in_month(forecast_year, forecast_month),
+                        }
+                    )
+
+                inventory_turnover = calc_turnover_display(on_hand_inventory, periods, fallback_month)
+                inventory_plus_transit_turnover = calc_turnover_display(inventory_plus_transit, periods, fallback_month)
+                inventory_plus_transit_meets = (
+                    "是"
+                    if isinstance(inventory_plus_transit_turnover, str)
+                    or inventory_plus_transit_turnover >= inventory_plan_turnover_days
+                    else "否"
+                )
+                qty_for_target_days = quantity_for_target_days(inventory_plan_turnover_days, periods)
+                inventory_plan_qty = ceil_to_multiple(max(qty_for_target_days - inventory_plus_transit, 0), PRODUCTION_LOT_SIZE)
+
+                plan_row = {
+                    "商品编码": sku["sku_code"],
+                    "商品名称": sku["sku_name"],
+                    "预测口径": row.get("预测口径", ""),
+                    "供应商": sku["supplier"],
+                    current_remaining_demand_col: current_remaining_demand,
+                    current_gap_col: max(math.ceil(current_remaining_demand - inventory_plus_transit), 0),
+                    "当前在途数量": in_transit_inventory,
+                    "当前库存数量": on_hand_inventory,
+                    "库存可周转天数": inventory_turnover,
+                    "库存+在途可周转天数": inventory_plus_transit_turnover,
+                    "库存+在途是否满足需求": inventory_plus_transit_meets,
+                    "库存计划量": inventory_plan_qty,
+                    "商品创建日期": sku["creation_date"],
+                }
+                for col_name, value in zip(future_demand_cols, future_demands):
+                    plan_row[col_name] = value
+                for col_name, value in zip(future_daily_cols, future_daily_usage):
+                    plan_row[col_name] = value
+                if cumulative_gap_col:
+                    plan_row[cumulative_gap_col] = max(
+                        math.ceil(current_remaining_demand + (future_demands[0] if future_demands else 0) - inventory_plus_transit),
+                        0,
+                    )
+
+                plan_results.append(plan_row)
 
         subtotal = {
             "商品编码": "合计",
@@ -1163,10 +1464,11 @@ def export_forecast(
         [
             ("销售数据截止日期：", latest_date_str, ""),
             ("库存快照时间：", inventory_latest_update_display, inventory_snapshot_note),
-            ("库存计划量可周转（天）：", INVENTORY_PLAN_TURNOVER_DAYS, "手动调整后会自动更新关联值"),
+            ("库存计划量可周转（天）：", inventory_plan_turnover_days, "手动调整后会自动更新关联值"),
             ("AI 预测周期（月）：", len(display_forecast_keys), f"默认 {DEFAULT_FORECAST_MONTHS} 个月，可在导出前配置，最多不超过当前预测 JSON"),
             ("产品分类：", included_categories, ""),
             ("SKU 数量：", included_sku_count, ""),
+            ("SKU 范围：", sku_scope_top_note or ("外部范围文件" if sku_scope_file else "全部目标品类 SKU"), ""),
         ],
         columns=["参数", "值", "说明"],
     )
@@ -1186,6 +1488,14 @@ def export_forecast(
         (
             "短历史兜底",
             "应用原则：不足 9 个完整月历史时使用。计算逻辑：当月按“已发生实际销量 + TimesFM 日度预测剩余天”计算，并尽量使用该 SKU 全部已有日历史销量记录；后续月份优先参考同 family_tags 的成熟 SKU 季节趋势，找不到则退回同产品分类，再退回全 SKU 季节趋势，仍找不到再按该当月锚点折算日均后外推。",
+        ),
+        (
+            "营销 uplift 校准",
+            "基于品级近 14 天环比、近 7 天趋势和近 30 天销量 Top10 识别短期营销/流量放大效应；只修正当前预测月，不默认延续到下月或更远月份，避免跨钓季/跨品类季节切换时误抬远月需求。SKU 分摊使用 35% 原 AI 预测占比 + 65% 近 14 天实际销量占比。",
+        ),
+        (
+            "气温/物候/钓季校准",
+            "钓具需求受气温、水温、节气、地区开钓期、禁渔/汛期等时效因子影响明显；这些因素更适合做 TimesFM 微调特征或二次校准模型，用于中远月季节转换，不应与短期营销 uplift 混为同一个长期放大系数。",
         ),
         (
             "当前月预测（本月均值参考）",
@@ -1687,7 +1997,10 @@ def export_forecast(
 
     # Inject cached formula values for Apple Numbers compatibility
     if demand_caches or plan_caches:
-        sheet_formula_caches = {1: demand_caches, 2: plan_caches}
+        sheet_formula_caches = {
+            wb.sheetnames.index(DEMAND_SHEET_NAME) + 1: demand_caches,
+            wb.sheetnames.index("生产计划") + 1: plan_caches,
+        }
         inject_cached_values_for_numbers(file_path, sheet_formula_caches)
 
     print(f"✅ 导出成功: {file_path}")
@@ -1701,6 +2014,12 @@ if __name__ == "__main__":
         help="SKU 范围文件路径；文件中需包含商品编码列或兼容列名，仅导出该范围内的 SKU",
     )
     parser.add_argument(
+        "--sku-scope-top-n",
+        type=int,
+        default=None,
+        help="按最近一个完整月销量 Top N SKU 过滤；例如 --sku-scope-top-n 100",
+    )
+    parser.add_argument(
         "--months",
         type=int,
         default=DEFAULT_FORECAST_MONTHS,
@@ -1711,9 +2030,20 @@ if __name__ == "__main__":
         default=None,
         help="预测结果 JSON 路径 (默认按最新销售流水日期匹配 jiuyan_forecasts_YYYYMMDD.json)",
     )
+    parser.add_argument(
+        "--turnover-days",
+        type=int,
+        default=INVENTORY_PLAN_TURNOVER_DAYS,
+        help=f"库存计划量可周转天数，默认 {INVENTORY_PLAN_TURNOVER_DAYS}",
+    )
     args = parser.parse_args()
+    if args.sku_scope_top_n is not None and args.sku_scope_top_n <= 0:
+        parser.error("--sku-scope-top-n 必须是正整数")
+
     export_forecast(
         sku_scope_file=args.sku_scope_file,
+        sku_scope_top_n=args.sku_scope_top_n,
         forecast_json_path=args.forecast_json,
         forecast_months=args.months,
+        inventory_plan_turnover_days=args.turnover_days,
     )
