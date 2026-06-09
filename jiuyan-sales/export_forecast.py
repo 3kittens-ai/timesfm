@@ -584,8 +584,9 @@ def month_offset_from_base(forecast_key, base_month_key):
 
 def apply_marketing_uplift_to_ai_group_rows(group_rows, group_bounds_rows, family_name, display_forecast_keys, base_month_key, uplift_context, recent14_by_sku):
     if not MARKETING_UPLIFT_ENABLED or not group_rows:
-        return
+        return set()
 
+    adjusted_cells = set()
     total_uplift = float((uplift_context.get(family_name) or {}).get("total_uplift", 0) or 0)
     product_recent14_qty = sum(float(recent14_by_sku.get(str(row["商品编码"]), 0) or 0) for row in group_rows)
 
@@ -626,9 +627,13 @@ def apply_marketing_uplift_to_ai_group_rows(group_rows, group_bounds_rows, famil
             else:
                 bounds_row[f"{forecast_key}__lower_80"] = max(new_forecast * 0.8, 0)
                 bounds_row[f"{forecast_key}__upper_80"] = max(new_forecast * 1.2, 0)
+            if abs(new_forecast - old_forecast) > 1e-9:
+                adjusted_cells.add((str(row["商品编码"]), forecast_key))
 
     for row in group_rows:
         row["预测合计"] = sum(row.get(ym_key, 0) for ym_key in display_forecast_keys)
+
+    return adjusted_cells
 
 
 def calc_turnover_display(quantity, periods, fallback_month):
@@ -993,6 +998,7 @@ def export_forecast(
     all_results = []
     plan_results = []
     bounds_results = []
+    marketing_adjusted_cells = set()
     grouped = df_skus.groupby(["product_category", "family_tags"], dropna=False)
 
     for (category, tags), group in grouped:
@@ -1164,14 +1170,16 @@ def export_forecast(
             group_bounds_rows.append(bounds_row)
 
         if MARKETING_UPLIFT_ENABLED:
-            apply_marketing_uplift_to_ai_group_rows(
-                group_rows,
-                group_bounds_rows,
-                family_name,
-                display_forecast_keys,
-                base_month_key,
-                marketing_uplift_context,
-                marketing_recent14_by_sku,
+            marketing_adjusted_cells.update(
+                apply_marketing_uplift_to_ai_group_rows(
+                    group_rows,
+                    group_bounds_rows,
+                    family_name,
+                    display_forecast_keys,
+                    base_month_key,
+                    marketing_uplift_context,
+                    marketing_recent14_by_sku,
+                )
             )
             for row in group_rows:
                 for mom_key in forecast_mom_keys:
@@ -1791,6 +1799,8 @@ def export_forecast(
             if col_name in display_forecast_keys and not (is_mom_row or is_yoy_row):
                 if raw_value and raw_value > max_12m:
                     cell.font = Font(color="FF0000", bold=is_total_row)
+                if not is_total_row and (str(raw_row.get("商品编码")), col_name) in marketing_adjusted_cells:
+                    cell.fill = blue_fill
 
             is_pct_value = (col_name in pct_cols_in_output) or ((is_mom_row or is_yoy_row) and (col_name in month_cols_in_output))
             if col_name in pct_headers or ((is_mom_row or is_yoy_row) and (col_name in display_forecast_keys)):
